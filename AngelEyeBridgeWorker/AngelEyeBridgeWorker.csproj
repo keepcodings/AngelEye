@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AssemblyName>angel-eye-bridge</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\AngelEyeBmsBridge\AngelEyeProtocol.cs" Link="Shared\AngelEyeProtocol.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\BmsApiClient.cs" Link="Shared\BmsApiClient.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\BridgeEventJournal.cs" Link="Shared\BridgeEventJournal.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\BridgeGameNumbering.cs" Link="Shared\BridgeGameNumbering.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\BridgeSettings.cs" Link="Shared\BridgeSettings.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\JwtTokenGenerator.cs" Link="Shared\JwtTokenGenerator.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\SerialListener.cs" Link="Shared\SerialListener.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\ShoeEndpoint.cs" Link="Shared\ShoeEndpoint.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.1" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.11" />
+    <PackageReference Include="System.IO.Ports" Version="10.0.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="appsettings.example.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="appsettings.qa.example.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="moxa-endpoints.pit9.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="DEPLOYMENT.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="systemd\angel-eye-bridge.service" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
