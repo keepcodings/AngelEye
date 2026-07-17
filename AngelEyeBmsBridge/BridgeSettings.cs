@@ -210,7 +210,7 @@ public sealed class BridgeSettings
 
     private static bool HasPit9Table(BridgeSettings settings, int tableNumber, string moxaHost)
     {
-        string sourceDataCode = $"ANGEL_BAC{tableNumber}";
+        string sourceDataCode = tableNumber.ToString();
         string shoeId = $"SHOE{tableNumber}";
         return settings.Shoes.Any(shoe =>
             string.Equals(shoe.SourceDataCode.Trim(), sourceDataCode, StringComparison.OrdinalIgnoreCase) ||
@@ -461,7 +461,7 @@ public sealed class ShoeEndpointSettings
     /// <returns>A physical MOXA TCP endpoint configuration.</returns>
     public static ShoeEndpointSettings CreatePit9MoxaEndpoint(int tableNumber, string moxaHost)
     {
-        return CreateMoxaEndpoint($"{tableNumber}桌", $"ANGEL_BAC{tableNumber}", $"SHOE{tableNumber}", moxaHost);
+        return CreateMoxaEndpoint($"{tableNumber}桌", tableNumber.ToString(), $"SHOE{tableNumber}", moxaHost);
     }
 
     /// <summary>

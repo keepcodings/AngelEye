@@ -1,0 +1,24 @@
+[Unit]
+Description=Xtasys ANGEL EYE Bridge Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=angelbridge
+Group=angelbridge
+WorkingDirectory=/opt/angel-eye-bridge
+Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+Environment=ANGEL_BRIDGE_CONFIG=/etc/angel-eye-bridge/appsettings.json
+ExecStart=/opt/angel-eye-bridge/angel-eye-bridge --config /etc/angel-eye-bridge/appsettings.json
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+SyslogIdentifier=angel-eye-bridge
+ReadWritePaths=/var/lib/angel-eye-bridge /var/log/angel-eye-bridge
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

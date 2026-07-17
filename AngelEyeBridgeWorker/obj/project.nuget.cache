@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "bPakH3ZkTc4=",
+  "dgSpecHash": "Vh98lkndGac=",
   "success": true,
-  "projectFilePath": "C:\\Git\\BMS\\GS\\AngelEyeBridgeWorker\\AngelEyeBridgeWorker.csproj",
+  "projectFilePath": "C:\\Git\\AngelEye\\AngelEyeBridgeWorker\\AngelEyeBridgeWorker.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\veryn\\.nuget\\packages\\microsoft.data.sqlite\\8.0.1\\microsoft.data.sqlite.8.0.1.nupkg.sha512",
     "C:\\Users\\veryn\\.nuget\\packages\\microsoft.data.sqlite.core\\8.0.1\\microsoft.data.sqlite.core.8.0.1.nupkg.sha512",
@@ -34,9 +34,9 @@
       "code": "NU1903",
       "level": "Warning",
       "message": "套件 'SQLitePCLRaw.lib.e_sqlite3' 2.1.11 具有已知的 高 嚴重性弱點，https://github.com/advisories/GHSA-2m69-gcr7-jv3q。",
-      "projectPath": "C:\\Git\\BMS\\GS\\AngelEyeBridgeWorker\\AngelEyeBridgeWorker.csproj",
+      "projectPath": "C:\\Git\\AngelEye\\AngelEyeBridgeWorker\\AngelEyeBridgeWorker.csproj",
       "warningLevel": 1,
-      "filePath": "C:\\Git\\BMS\\GS\\AngelEyeBridgeWorker\\AngelEyeBridgeWorker.csproj",
+      "filePath": "C:\\Git\\AngelEye\\AngelEyeBridgeWorker\\AngelEyeBridgeWorker.csproj",
       "libraryId": "SQLitePCLRaw.lib.e_sqlite3",
       "targetGraphs": [
         "net10.0"

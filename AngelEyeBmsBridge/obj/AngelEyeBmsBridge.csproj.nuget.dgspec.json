@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj": {}
+    "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj": {}
   },
   "projects": {
-    "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj": {
+    "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
+        "projectUniqueName": "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
         "projectName": "AngelEyeBmsBridge",
-        "projectPath": "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
+        "projectPath": "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
         "packagesPath": "C:\\Users\\veryn\\.nuget\\packages\\",
-        "outputPath": "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\obj\\",
+        "outputPath": "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\obj\\",
         "projectStyle": "PackageReference",
         "fallbackFolders": [
           "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"

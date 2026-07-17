@@ -2002,11 +2002,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
+      "projectUniqueName": "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
       "projectName": "AngelEyeBmsBridge",
-      "projectPath": "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
+      "projectPath": "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\AngelEyeBmsBridge.csproj",
       "packagesPath": "C:\\Users\\veryn\\.nuget\\packages\\",
-      "outputPath": "C:\\Git\\BMS\\GS\\AngelEyeBmsBridge\\obj\\",
+      "outputPath": "C:\\Git\\AngelEye\\AngelEyeBmsBridge\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
@@ -2372,7 +2372,7 @@
       "code": "NU1903",
       "level": "Warning",
       "warningLevel": 1,
-      "message": "Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.6 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q",
+      "message": "套件 'SQLitePCLRaw.lib.e_sqlite3' 2.1.6 具有已知的 高 嚴重性弱點，https://github.com/advisories/GHSA-2m69-gcr7-jv3q。",
       "libraryId": "SQLitePCLRaw.lib.e_sqlite3",
       "targetGraphs": [
         "net10.0-windows7.0"
