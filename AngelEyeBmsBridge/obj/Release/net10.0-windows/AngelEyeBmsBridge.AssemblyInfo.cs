@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AngelEyeBmsBridge")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+66c2a8cd2073998b35e9d56fa29d08841cd1631a")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+fd6691cc188d16e4c9a31b2297fb1abb7dad16e7")]
 [assembly: System.Reflection.AssemblyProductAttribute("AngelEyeBmsBridge")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AngelEyeBmsBridge")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

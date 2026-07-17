@@ -54,6 +54,9 @@ public partial class Form1 : Form
     private Label? lblConnectionModeStatus;
 
     private DataGridView? dgvEndpoints;
+    private GroupBox? endpointListGroup;
+    private TableLayoutPanel? endpointListLayout;
+    private FlowLayoutPanel? endpointListToolbar;
     private ToggleSwitch? chkEndpointEnabled;
     private ToggleSwitch? chkEndpointMock;
     private TextBox? txtDeskName;
@@ -109,7 +112,6 @@ public partial class Form1 : Form
     private ShoeEndpoint? _logEndpointFilter;
 
     private const int ProtectedMainContentHeight = 220;
-    private const int PreferredEventLogHeight = 150;
     private const int MinimumEventLogHeight = 90;
     private const int MinimumCardPreviewHeight = 260;
     private const int AutoRunDealDelaySeconds = 2;
@@ -588,6 +590,7 @@ public partial class Form1 : Form
             Text = " 桌台 / 端點清單 ",
             Font = new Font("Microsoft JhengHei", 10F, FontStyle.Bold)
         };
+        endpointListGroup = group;
 
         TableLayoutPanel layout = new()
         {
@@ -598,6 +601,7 @@ public partial class Form1 : Form
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        endpointListLayout = layout;
 
         dgvEndpoints = new DataGridView
         {
@@ -683,6 +687,7 @@ public partial class Form1 : Form
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight
         };
+        endpointListToolbar = buttons;
         Button btnAdd = new() { Text = "新增", Width = 70, Height = 28 };
         Button btnRemove = new() { Text = "移除", Width = 70, Height = 28 };
         Button btnRefresh = new() { Text = "刷新 COM", Width = 90, Height = 28 };
@@ -2095,12 +2100,10 @@ public partial class Form1 : Form
         if (mainSplit != null && mainSplit.Panel2Collapsed)
         {
             mainSplit.Panel2Collapsed = false;
-            mainSplit.PerformLayout();
-            ApplyMainSplitterBounds(mainSplit.Height - PreferredEventLogHeight);
+            PositionEventLogBelowEndpointList();
         }
 
         RenderLogEntries();
-        AppendLog(endpoint, "SYS", "已開啟此端點事件日誌。");
     }
 
     private bool IsShowingEndpointLog(ShoeEndpoint endpoint)
@@ -5083,8 +5086,7 @@ public partial class Form1 : Form
         {
             try
             {
-                mainSplit.PerformLayout();
-                ApplyMainSplitterBounds(mainSplit.Height - PreferredEventLogHeight);
+                PositionEventLogBelowEndpointList();
             }
             catch (Exception ex)
             {
@@ -5175,12 +5177,53 @@ public partial class Form1 : Form
             return (0, 0);
         }
 
-        int eventLogHeight = Math.Min(PreferredEventLogHeight, Math.Max(MinimumEventLogHeight, availableHeight / 5));
-        eventLogHeight = Math.Min(eventLogHeight, availableHeight);
-
-        int minimumDistance = Math.Min(ProtectedMainContentHeight, Math.Max(0, availableHeight - eventLogHeight));
-        int maximumDistance = Math.Max(minimumDistance, mainSplit.Height - mainSplit.SplitterWidth - eventLogHeight);
+        int minimumDistance = Math.Min(GetCompactEndpointListHeight(), Math.Max(0, availableHeight - MinimumEventLogHeight));
+        int maximumDistance = Math.Max(minimumDistance, availableHeight - MinimumEventLogHeight);
         return (minimumDistance, maximumDistance);
+    }
+
+    private void PositionEventLogBelowEndpointList()
+    {
+        if (mainSplit == null || mainSplit.Panel2Collapsed)
+        {
+            return;
+        }
+
+        mainSplit.PerformLayout();
+        ApplyMainSplitterBounds(GetCompactEndpointListHeight());
+
+        // Row heights and scrollbars finish laying out after the collapsed panel is restored.
+        BeginInvoke(new Action(() =>
+        {
+            if (mainSplit != null && !mainSplit.Panel2Collapsed && !IsDisposed)
+            {
+                ApplyMainSplitterBounds(GetCompactEndpointListHeight());
+            }
+        }));
+    }
+
+    private int GetCompactEndpointListHeight()
+    {
+        if (dgvEndpoints == null)
+        {
+            return ProtectedMainContentHeight;
+        }
+
+        int rowHeight = dgvEndpoints.Rows.GetRowsHeight(DataGridViewElementStates.Visible);
+        int headerHeight = dgvEndpoints.ColumnHeadersVisible ? dgvEndpoints.ColumnHeadersHeight : 0;
+        int horizontalScrollHeight = dgvEndpoints.Controls.OfType<HScrollBar>().Any(scrollBar => scrollBar.Visible)
+            ? SystemInformation.HorizontalScrollBarHeight
+            : 0;
+        int groupHeaderHeight = endpointListGroup?.DisplayRectangle.Top ?? 22;
+        int layoutPadding = endpointListLayout?.Padding.Vertical ?? 16;
+        int toolbarHeight = endpointListLayout?.RowStyles.Count > 1
+            ? (int)Math.Ceiling(endpointListLayout.RowStyles[1].Height)
+            : endpointListToolbar?.PreferredSize.Height ?? 38;
+        int controlMargins = dgvEndpoints.Margin.Vertical + (endpointListToolbar?.Margin.Vertical ?? 0);
+
+        return Math.Max(
+            ProtectedMainContentHeight,
+            groupHeaderHeight + layoutPadding + headerHeight + rowHeight + horizontalScrollHeight + toolbarHeight + controlMargins + 2);
     }
 
     private static Label CreateTopFieldLabel(string text)
