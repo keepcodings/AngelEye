@@ -8,8 +8,11 @@ namespace AngelEyeBmsBridge;
 /// </summary>
 public sealed class BridgeSettings
 {
-    private const string DefaultDevSourceProviderSigningKey = "{adf00056-f02f-4a47-8e31-d9322286e7ea}-{c63a95ff-cf81-4c49-a8c9-791b36dc9831}";
-    private const string DefaultBmsUrl = "http://localhost:8111/api/source/angel/events";
+    // Deployment secrets stay in each machine's local SQLite settings, never in source control.
+    private const string DefaultSourceProviderSigningKey = "";
+    private const string DefaultBmsUrl = "https://redhood67.infinitybeyonder888test.com/api/source/angel/events";
+    private const string DefaultAngelMidoriProviderId = "899e293f-cf47-46b0-bde0-2ed3c7395f17";
+    private const string DefaultAngelMidoriTokenSerial = "b1b696a8-70f4-41d6-a549-bc2f4592cf6f";
     private const string SettingsKey = "bridge_settings_json";
 
     /// <summary>BMS event API URL.</summary>
@@ -19,10 +22,10 @@ public sealed class BridgeSettings
     public string BmsToken { get; set; } = string.Empty;
 
     /// <summary>JWT source provider identifier claim.</summary>
-    public string JwtNameIdentifier { get; set; } = "475393a6-6965-4753-b640-8778fcfb3e45";
+    public string JwtNameIdentifier { get; set; } = DefaultAngelMidoriProviderId;
 
     /// <summary>JWT source provider token serial number claim.</summary>
-    public string JwtSerialNumber { get; set; } = "62676254-1cdd-4b4e-ab88-8e90ba9bb8ba";
+    public string JwtSerialNumber { get; set; } = DefaultAngelMidoriTokenSerial;
 
     /// <summary>JWT issuer expected by BMS.</summary>
     public string JwtIssuer { get; set; } = "gs.com";
@@ -31,7 +34,7 @@ public sealed class BridgeSettings
     public string JwtAudience { get; set; } = "BMS RESTful API";
 
     /// <summary>Shared HS256 signing key used to create source provider tokens.</summary>
-    public string JwtSigningKey { get; set; } = DefaultDevSourceProviderSigningKey;
+    public string JwtSigningKey { get; set; } = DefaultSourceProviderSigningKey;
 
     /// <summary>Generated JWT lifetime in minutes.</summary>
     public int JwtLifetimeMinutes { get; set; } = 10080;
@@ -286,12 +289,12 @@ public sealed class BridgeSettings
     {
         if (string.IsNullOrWhiteSpace(settings.JwtNameIdentifier))
         {
-            settings.JwtNameIdentifier = "475393a6-6965-4753-b640-8778fcfb3e45";
+            settings.JwtNameIdentifier = DefaultAngelMidoriProviderId;
         }
 
         if (string.IsNullOrWhiteSpace(settings.JwtSerialNumber))
         {
-            settings.JwtSerialNumber = "62676254-1cdd-4b4e-ab88-8e90ba9bb8ba";
+            settings.JwtSerialNumber = DefaultAngelMidoriTokenSerial;
         }
 
         if (string.IsNullOrWhiteSpace(settings.JwtIssuer))
@@ -306,7 +309,7 @@ public sealed class BridgeSettings
 
         if (string.IsNullOrWhiteSpace(settings.JwtSigningKey))
         {
-            settings.JwtSigningKey = DefaultDevSourceProviderSigningKey;
+            settings.JwtSigningKey = DefaultSourceProviderSigningKey;
         }
 
         if (settings.JwtLifetimeMinutes <= 0)
@@ -461,7 +464,13 @@ public sealed class ShoeEndpointSettings
     /// <returns>A physical MOXA TCP endpoint configuration.</returns>
     public static ShoeEndpointSettings CreatePit9MoxaEndpoint(int tableNumber, string moxaHost)
     {
-        return CreateMoxaEndpoint($"{tableNumber}桌", tableNumber.ToString(), $"SHOE{tableNumber}", moxaHost);
+        return tableNumber switch
+        {
+            901 => CreateMoxaEndpoint("901桌", "901", "SHOE901", moxaHost, "9d1f77f4-4f00-40ce-bda6-8cd6476a2ad4", bmsTransmitEnabled: true),
+            902 => CreateMoxaEndpoint("902桌", "902", "SHOE902", moxaHost, "9ed122db-7622-42bf-a4cc-c84a2503a351"),
+            903 => CreateMoxaEndpoint("903桌", "903", "SHOE903", moxaHost, "5c3762c6-ea07-44a1-b6ad-b4467b1fdddd"),
+            _ => CreateMoxaEndpoint($"{tableNumber}桌", tableNumber.ToString(), $"SHOE{tableNumber}", moxaHost)
+        };
     }
 
     /// <summary>
@@ -477,15 +486,17 @@ public sealed class ShoeEndpointSettings
         string deskName,
         string sourceDataCode,
         string shoeId,
-        string moxaHost)
+        string moxaHost,
+        string sourceDataId = "",
+        bool bmsTransmitEnabled = false)
     {
         return new ShoeEndpointSettings
         {
             Enabled = true,
-            BmsTransmitEnabled = false,
+            BmsTransmitEnabled = bmsTransmitEnabled,
             DeskId = Guid.Empty.ToString(),
             DeskName = deskName,
-            SourceDataId = string.Empty,
+            SourceDataId = sourceDataId,
             SourceDataCode = sourceDataCode,
             ShoeId = shoeId,
             CurrentShoe = BridgeGameNumbering.TodayFirstShoe(),

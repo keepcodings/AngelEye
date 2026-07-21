@@ -405,9 +405,9 @@ public sealed class ShoeEndpoint
     /// <summary>
     /// Advances to the next BMS shoe and resets round and preview state.
     /// </summary>
-    public void StartNewShoe()
+    public void StartNewShoe(DateTime? now = null)
     {
-        CurrentShoe = BridgeGameNumbering.NextShoe(CurrentShoe);
+        CurrentShoe = BridgeGameNumbering.NextShoe(CurrentShoe, now);
         CurrentRound = 0;
         CurrentRoundId = null;
         _roundInProgress = false;
@@ -504,7 +504,7 @@ public sealed class ShoeEndpoint
     /// <summary>
     /// Starts the next local round and clears preview cards before the betting countdown.
     /// </summary>
-    public void BeginNextRoundCountdown()
+    public void BeginNextRoundCountdown(bool alignShoeDateForNewRound = true)
     {
         if (CurrentShoe <= 0)
         {
@@ -514,6 +514,14 @@ public sealed class ShoeEndpoint
         if (_roundInProgress && !_roundSettled && CurrentRound > 0)
         {
             return;
+        }
+
+        // A game number is immutable after its first card.  The date is checked only
+        // when a new round is about to begin, never while receiving later cards/results.
+        if (alignShoeDateForNewRound && !BridgeGameNumbering.IsShoeForDate(CurrentShoe, DateTime.Now))
+        {
+            StartNewShoe();
+            LogReceived?.Invoke(this, "SYS", $"Cross-day new round: switched BMS shoe to {CurrentShoe}.");
         }
 
         CurrentRound++;

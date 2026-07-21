@@ -139,21 +139,21 @@ public sealed class WorkerSettings
 
 public sealed class BmsWorkerSettings
 {
-    public string EventApiUrl { get; set; } = "http://localhost:8111/api/source/angel/events";
+    public string EventApiUrl { get; set; } = "https://redhood67.infinitybeyonder888test.com/api/source/angel/events";
 
     public string Token { get; set; } = string.Empty;
 
     public bool AutoGenerateJwt { get; set; } = true;
 
-    public string JwtNameIdentifier { get; set; } = "475393a6-6965-4753-b640-8778fcfb3e45";
+    public string JwtNameIdentifier { get; set; } = "899e293f-cf47-46b0-bde0-2ed3c7395f17";
 
-    public string JwtSerialNumber { get; set; } = "62676254-1cdd-4b4e-ab88-8e90ba9bb8ba";
+    public string JwtSerialNumber { get; set; } = "b1b696a8-70f4-41d6-a549-bc2f4592cf6f";
 
     public string JwtIssuer { get; set; } = "gs.com";
 
     public string JwtAudience { get; set; } = "BMS RESTful API";
 
-    public string JwtSigningKey { get; set; } = "{adf00056-f02f-4a47-8e31-d9322286e7ea}-{c63a95ff-cf81-4c49-a8c9-791b36dc9831}";
+    public string JwtSigningKey { get; set; } = string.Empty;
 
     public int JwtLifetimeMinutes { get; set; } = 10080;
 

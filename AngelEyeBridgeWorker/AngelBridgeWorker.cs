@@ -243,6 +243,15 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             return;
         }
 
+        // Do not create yesterday's StartGame merely because the worker restarted
+        // after midnight.  The next card tells us whether an old game is continuing
+        // (for example Banker #1 after Player #1 at 23:59) or Player #1 is a new game.
+        if (endpoint.CurrentShoe > 0 && !BridgeGameNumbering.IsShoeForDate(endpoint.CurrentShoe, DateTime.Now))
+        {
+            Log(endpoint, "SYS", $"跨日啟動，保留 {endpoint.CurrentShoe}/{endpoint.CurrentRound} 並等待下一筆牌訊判定是否為新局。");
+            return;
+        }
+
         await BeginRoundCountdownAsync(endpoint, DateTimeOffset.UtcNow, endpoint.CurrentRound > 0 ? "啟動時延續當前局" : "啟動時建立第一局").ConfigureAwait(false);
     }
 

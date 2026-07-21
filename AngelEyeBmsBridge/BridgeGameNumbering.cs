@@ -29,6 +29,18 @@ public static class BridgeGameNumbering
     }
 
     /// <summary>
+    /// Determines whether a BMS shoe number belongs to the specified local date.
+    /// </summary>
+    /// <param name="shoe">BMS shoe number in yyyyMMddNNNN format.</param>
+    /// <param name="date">The local date to compare with the shoe prefix.</param>
+    /// <returns><see langword="true"/> when the shoe uses the specified date prefix.</returns>
+    public static bool IsShoeForDate(long shoe, DateTime date)
+    {
+        long datePrefix = long.Parse(date.ToString("yyyyMMdd", CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
+        return shoe > 0 && shoe / ShoeSequenceBase == datePrefix;
+    }
+
+    /// <summary>
     /// Advances the current shoe number, resetting to 0001 when the local date changes.
     /// </summary>
     /// <param name="currentShoe">Current BMS shoe number.</param>
