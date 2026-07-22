@@ -29,10 +29,6 @@ public partial class Form1 : Form
     private readonly Dictionary<ShoeEndpoint, BaccaratAutoRunSession> _autoRunSessions = [];
     private readonly Dictionary<ShoeEndpoint, BridgeOutboxStatus> _outboxStatuses = [];
     private readonly Dictionary<ShoeEndpoint, PendingNextRoundCountdown> _pendingNextRoundCountdowns = [];
-    private readonly HashSet<ShoeEndpoint> _cutCardAutoLockedEndpoints = [];
-    private readonly object _cutCardAutoLockGate = new();
-    private readonly HashSet<ShoeEndpoint> _resultHoldAutoLockedEndpoints = [];
-    private readonly object _resultHoldAutoLockGate = new();
     private readonly HashSet<string> _handledBmsCommandIds = [];
     private bool _autoRunTickInProgress;
     private bool _outboxStatusRefreshInProgress;
@@ -162,7 +158,13 @@ public partial class Form1 : Form
 
     private sealed record ButtonVisualStyle(Color BackColor, Color ForeColor, Color BorderColor);
 
-    private sealed record UiLogEntry(DateTime Timestamp, ShoeEndpoint? Endpoint, string Type, string Message);
+    private sealed record UiLogEntry(
+        DateTime Timestamp,
+        ShoeEndpoint? Endpoint,
+        long? Shoe,
+        long? Round,
+        string Type,
+        string Message);
 
     private sealed record DuplicateEndpointField(string Label, string Value, ShoeEndpoint Endpoint);
 
@@ -1369,7 +1371,6 @@ public partial class Form1 : Form
         else
         {
             _settings.AllowPhysicalShoeCommands = false;
-            ClearPhysicalCommandAutoLockTracking();
             AppendLog(SelectedEndpoint, "SYS", "工程授權已關閉，正式模式改為唯讀；若牌盒仍鎖定，請由牌盒本機流程處理。");
         }
 
@@ -1474,19 +1475,6 @@ public partial class Form1 : Form
 
         AppendLog(endpoint, "WARN", $"{action}未送出：正式模式唯讀，未啟用工程授權。");
         return false;
-    }
-
-    private void ClearPhysicalCommandAutoLockTracking()
-    {
-        lock (_cutCardAutoLockGate)
-        {
-            _cutCardAutoLockedEndpoints.Clear();
-        }
-
-        lock (_resultHoldAutoLockGate)
-        {
-            _resultHoldAutoLockedEndpoints.Clear();
-        }
     }
 
     private void SetEndpointSettingsEditMode(bool editMode)
@@ -1853,7 +1841,7 @@ public partial class Form1 : Form
 
         Label shoeHint = new()
         {
-            Text = "換靴完成後按；更新靴局，必要時解除切牌鎖定。",
+            Text = "換靴完成後按；只更新 Bridge 靴局，不送牌盒控制命令。",
             AutoSize = true,
             Height = 28,
             Padding = new Padding(12, 6, 0, 0),
@@ -2259,12 +2247,6 @@ public partial class Form1 : Form
         if (card.EventCode != 'R' && card.Target == "Player" && card.Index == 1)
         {
             CancelPendingNextRoundCountdown(endpoint);
-            if (!await ReleaseResultHoldAutoLockIfNeededAsync(endpoint))
-            {
-                AppendLog(endpoint, "WARN", "結算後自動鎖定尚未解除，略過下一局第一張牌。");
-                return;
-            }
-
             await PublishStartGameIfNeededAsync(endpoint);
         }
 
@@ -2299,7 +2281,6 @@ public partial class Form1 : Form
             pair = result.Pair
         });
         ScheduleNextRoundCountdownAfterResult(endpoint);
-        _ = LockEndpointForResultHoldAsync(endpoint);
     }
 
     private async void Endpoint_CuttingCardDrawn(ShoeEndpoint endpoint, SerialListener.CutCardInfo cutCard)
@@ -2314,7 +2295,6 @@ public partial class Form1 : Form
             shoeEnding = true,
             rawBytes = cutCard.RawBytes
         });
-        await LockEndpointAfterCutCardAsync(endpoint);
     }
 
     private async void Endpoint_ErrorOccurred(ShoeEndpoint endpoint, SerialListener.ErrorInfo error)
@@ -2422,7 +2402,7 @@ public partial class Form1 : Form
                 continue;
             }
 
-            if (!await ReleaseResultHoldAutoLockIfNeededAsync(endpoint) || !endpoint.IsConnected)
+            if (!endpoint.IsConnected)
             {
                 continue;
             }
@@ -3366,8 +3346,6 @@ public partial class Form1 : Form
         }
         StopAutoRun(endpoint);
         CancelPendingNextRoundCountdown(endpoint);
-        ClearCutCardAutoLock(endpoint);
-        ClearResultHoldAutoLock(endpoint);
 
         endpoint.Disconnect();
         _endpoints.Remove(endpoint);
@@ -3493,234 +3471,6 @@ public partial class Form1 : Form
         AppendLog(endpoint, "SYS", "牌盒已斷線。");
     }
 
-    private async Task LockEndpointForResultHoldAsync(ShoeEndpoint endpoint)
-    {
-        if (endpoint.MockMode || endpoint.ShoeEnding)
-        {
-            ClearResultHoldAutoLock(endpoint);
-            return;
-        }
-
-        if (!CanSendShoeCommand(endpoint, "結算後自動鎖定"))
-        {
-            ClearResultHoldAutoLock(endpoint);
-            return;
-        }
-
-        if (!endpoint.IsConnected)
-        {
-            ClearResultHoldAutoLock(endpoint);
-            AppendLog(endpoint, "WARN", "結算後牌盒未連線，無法自動鎖定。");
-            return;
-        }
-
-        if (endpoint.IsLocked == true)
-        {
-            AppendLog(endpoint, "SYS", "結算後牌盒目前已鎖定，保留現有鎖定狀態。");
-            return;
-        }
-
-        MarkResultHoldAutoLocked(endpoint);
-        SerialListener.SerialCommandResult result = await endpoint.SetLockAsync(true);
-        AppendLog(endpoint, result.Succeeded ? "ACK" : "NAK", $"結算後自動鎖定: {result.Message}");
-        if (!result.Succeeded)
-        {
-            ClearResultHoldAutoLock(endpoint);
-            AppendLog(endpoint, "WARN", "結算後自動鎖定失敗；Bridge 仍會在結果保留結束後嘗試進入下一局。");
-        }
-    }
-
-    private async Task<bool> ReleaseResultHoldAutoLockIfNeededAsync(ShoeEndpoint endpoint)
-    {
-        if (!IsResultHoldAutoLocked(endpoint))
-        {
-            return true;
-        }
-
-        if (endpoint.MockMode)
-        {
-            ClearResultHoldAutoLock(endpoint);
-            return true;
-        }
-
-        if (!CanSendShoeCommand(endpoint, "解除結算後自動鎖定"))
-        {
-            ClearResultHoldAutoLock(endpoint);
-            return true;
-        }
-
-        if (!endpoint.IsConnected)
-        {
-            AppendLog(endpoint, "WARN", "牌盒未連線，無法解除結算後自動鎖定；下一局倒數未啟動。");
-            RefreshEndpointGridRow(endpoint);
-            if (ReferenceEquals(endpoint, SelectedEndpoint))
-            {
-                RefreshSelectedEndpointView(endpoint);
-            }
-            return false;
-        }
-
-        SerialListener.SerialCommandResult result = await endpoint.SetLockAsync(false);
-        AppendLog(endpoint, result.Succeeded ? "ACK" : "NAK", $"解除結算後自動鎖定: {result.Message}");
-        if (result.Succeeded)
-        {
-            ClearResultHoldAutoLock(endpoint);
-            return true;
-        }
-
-        AppendLog(endpoint, "WARN", "結算後自動鎖定尚未解除；下一局倒數未啟動，請確認牌盒連線或手動解鎖。");
-        RefreshEndpointGridRow(endpoint);
-        if (ReferenceEquals(endpoint, SelectedEndpoint))
-        {
-            RefreshSelectedEndpointView(endpoint);
-        }
-        return false;
-    }
-
-    private void MarkResultHoldAutoLocked(ShoeEndpoint endpoint)
-    {
-        lock (_resultHoldAutoLockGate)
-        {
-            _resultHoldAutoLockedEndpoints.Add(endpoint);
-        }
-    }
-
-    private bool IsResultHoldAutoLocked(ShoeEndpoint endpoint)
-    {
-        lock (_resultHoldAutoLockGate)
-        {
-            return _resultHoldAutoLockedEndpoints.Contains(endpoint);
-        }
-    }
-
-    private void ClearResultHoldAutoLock(ShoeEndpoint endpoint)
-    {
-        lock (_resultHoldAutoLockGate)
-        {
-            _resultHoldAutoLockedEndpoints.Remove(endpoint);
-        }
-    }
-
-    private async Task LockEndpointAfterCutCardAsync(ShoeEndpoint endpoint)
-    {
-        if (endpoint.MockMode)
-        {
-            ClearCutCardAutoLock(endpoint);
-            AppendLog(endpoint, "SYS", "Mock 切牌不送牌盒鎖定請求。");
-            return;
-        }
-
-        if (!CanSendShoeCommand(endpoint, "切牌後自動鎖定"))
-        {
-            ClearCutCardAutoLock(endpoint);
-            return;
-        }
-
-        if (!endpoint.IsConnected)
-        {
-            ClearCutCardAutoLock(endpoint);
-            AppendLog(endpoint, "WARN", "切牌已抽出，但牌盒未連線，無法自動鎖定。");
-            return;
-        }
-
-        if (endpoint.IsLocked == true)
-        {
-            if (IsResultHoldAutoLocked(endpoint))
-            {
-                ClearResultHoldAutoLock(endpoint);
-                MarkCutCardAutoLocked(endpoint);
-                AppendLog(endpoint, "SYS", "結算後自動鎖定已轉為切牌鎖定。");
-                return;
-            }
-
-            AppendLog(endpoint, "SYS", "切牌已抽出，牌盒目前已鎖定，保留現有鎖定狀態。");
-            return;
-        }
-
-        SerialListener.SerialCommandResult result = await endpoint.SetLockAsync(true);
-        AppendLog(endpoint, result.Succeeded ? "ACK" : "NAK", $"切牌後自動鎖定: {result.Message}");
-        if (result.Succeeded)
-        {
-            MarkCutCardAutoLocked(endpoint);
-        }
-        else
-        {
-            ClearCutCardAutoLock(endpoint);
-            AppendLog(endpoint, "WARN", "切牌後自動鎖定失敗；未按「新靴」前收到的牌面仍會被 Bridge 忽略。");
-        }
-    }
-
-    private async Task<bool> ReleaseCutCardAutoLockIfNeededAsync(ShoeEndpoint endpoint)
-    {
-        if (!IsCutCardAutoLocked(endpoint))
-        {
-            return true;
-        }
-
-        if (endpoint.MockMode)
-        {
-            ClearCutCardAutoLock(endpoint);
-            return true;
-        }
-
-        if (!CanSendShoeCommand(endpoint, "解除切牌後自動鎖定"))
-        {
-            ClearCutCardAutoLock(endpoint);
-            return true;
-        }
-
-        if (!endpoint.IsConnected)
-        {
-            AppendLog(endpoint, "WARN", "牌盒未連線，無法解除切牌後自動鎖定；新靴流程未啟動。");
-            RefreshEndpointGridRow(endpoint);
-            if (ReferenceEquals(endpoint, SelectedEndpoint))
-            {
-                RefreshSelectedEndpointView(endpoint);
-            }
-            return false;
-        }
-
-        SerialListener.SerialCommandResult result = await endpoint.SetLockAsync(false);
-        AppendLog(endpoint, result.Succeeded ? "ACK" : "NAK", $"解除切牌後自動鎖定: {result.Message}");
-        if (result.Succeeded)
-        {
-            ClearCutCardAutoLock(endpoint);
-            return true;
-        }
-
-        AppendLog(endpoint, "WARN", "切牌後自動鎖定尚未解除；新靴流程未啟動，請確認牌盒連線或手動解鎖。");
-        RefreshEndpointGridRow(endpoint);
-        if (ReferenceEquals(endpoint, SelectedEndpoint))
-        {
-            RefreshSelectedEndpointView(endpoint);
-        }
-        return false;
-    }
-
-    private void MarkCutCardAutoLocked(ShoeEndpoint endpoint)
-    {
-        lock (_cutCardAutoLockGate)
-        {
-            _cutCardAutoLockedEndpoints.Add(endpoint);
-        }
-    }
-
-    private bool IsCutCardAutoLocked(ShoeEndpoint endpoint)
-    {
-        lock (_cutCardAutoLockGate)
-        {
-            return _cutCardAutoLockedEndpoints.Contains(endpoint);
-        }
-    }
-
-    private void ClearCutCardAutoLock(ShoeEndpoint endpoint)
-    {
-        lock (_cutCardAutoLockGate)
-        {
-            _cutCardAutoLockedEndpoints.Remove(endpoint);
-        }
-    }
-
     private async Task StartNewShoeForSelectedEndpointAsync()
     {
         ShoeEndpoint? endpoint = SelectedEndpoint;
@@ -3730,16 +3480,6 @@ public partial class Form1 : Form
         }
         StopAutoRun(endpoint);
         CancelPendingNextRoundCountdown(endpoint);
-
-        if (!await ReleaseResultHoldAutoLockIfNeededAsync(endpoint))
-        {
-            return;
-        }
-
-        if (!await ReleaseCutCardAutoLockIfNeededAsync(endpoint))
-        {
-            return;
-        }
 
         if (endpoint.IsConnected && endpoint.IsLocked == true)
         {
@@ -3787,11 +3527,6 @@ public partial class Form1 : Form
 
         SerialListener.SerialCommandResult result = await endpoint.SetLockAsync(locked);
         AppendLog(endpoint, result.Succeeded ? "ACK" : "NAK", result.Message);
-        if (result.Succeeded && !locked)
-        {
-            ClearCutCardAutoLock(endpoint);
-            ClearResultHoldAutoLock(endpoint);
-        }
     }
 
     private async Task SendSelectedCancelErrorAsync()
@@ -4954,7 +4689,13 @@ public partial class Form1 : Form
             return;
         }
 
-        UiLogEntry entry = new(DateTime.Now, endpoint, type, EnsureAngelLogTag(message));
+        UiLogEntry entry = new(
+            DateTime.Now,
+            endpoint,
+            endpoint?.CurrentShoe,
+            endpoint?.CurrentRound,
+            type,
+            EnsureAngelLogTag(message));
         _uiLogEntries.Add(entry);
         if (_uiLogEntries.Count > MaxUiLogRows)
         {
@@ -5015,8 +4756,8 @@ public partial class Form1 : Form
         ListViewItem item = new(entry.Timestamp.ToString("HH:mm:ss.fff"));
         item.SubItems.Add(entry.Endpoint?.SourceDataCode ?? "-");
         item.SubItems.Add(entry.Endpoint?.ShoeId ?? "-");
-        item.SubItems.Add(entry.Endpoint?.CurrentShoe.ToString(CultureInfo.InvariantCulture) ?? "-");
-        item.SubItems.Add(entry.Endpoint?.CurrentRound.ToString(CultureInfo.InvariantCulture) ?? "-");
+        item.SubItems.Add(entry.Shoe?.ToString(CultureInfo.InvariantCulture) ?? "-");
+        item.SubItems.Add(entry.Round?.ToString(CultureInfo.InvariantCulture) ?? "-");
         item.SubItems.Add(entry.Type);
         item.SubItems.Add(entry.Message);
 
