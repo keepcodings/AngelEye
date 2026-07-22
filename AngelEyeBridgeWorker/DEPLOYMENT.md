@@ -1,15 +1,11 @@
-# ANGEL EYE Bridge Ubuntu Service
+# ANGEL EYE Bridge Rocky Linux Service
 
 ## 架構
 
-一台 Ubuntu 建議只跑一個 `angel-eye-bridge.service`。  
+一台 Rocky Linux 建議只跑一個 `angel-eye-bridge.service`。
 這個 service 讀取一份 `/etc/angel-eye-bridge/appsettings.json`，在同一個進程內管理多張桌 / 多個 NPort 5110。
 
-多台 Ubuntu 不需要改程式，只要每台放自己的設定檔：
-
-- Ubuntu-A：設定 901、902
-- Ubuntu-B：設定 903、904
-- 服務名稱都可以是 `angel-eye-bridge.service`
+三台 TeleBet VM 使用同一套程式，各自放對應角色的設定檔；服務名稱都使用 `angel-eye-bridge.service`。
 
 ## 目錄
 
@@ -27,7 +23,7 @@ sudo useradd --system --home /var/lib/angel-eye-bridge --shell /usr/sbin/nologin
 sudo mkdir -p /opt/angel-eye-bridge /etc/angel-eye-bridge /var/lib/angel-eye-bridge
 sudo chown -R angelbridge:angelbridge /var/lib/angel-eye-bridge
 sudo cp -r publish/* /opt/angel-eye-bridge/
-sudo cp appsettings.example.json /etc/angel-eye-bridge/appsettings.json
+sudo cp appsettings.server-29.qa.example.json /etc/angel-eye-bridge/appsettings.json
 sudo cp systemd/angel-eye-bridge.service /etc/systemd/system/angel-eye-bridge.service
 sudo systemctl daemon-reload
 sudo systemctl enable angel-eye-bridge
@@ -47,10 +43,13 @@ sudo systemctl start angel-eye-bridge
 
 ## PIT9 設定檔
 
-目前套件內有兩份 PIT9 用設定範本：
+目前套件內有三份 Midori / PIT9 設定範本：
 
-- `appsettings.example.json`：正式區，901 / 902 / 903，預設 `bmsTransmitEnabled=false`，先用來驗證 MOXA 收資料。
-- `appsettings.qa.example.json`：測試區 QA 桌，預設 `bmsTransmitEnabled=false`，先用來驗證 MOXA 收資料。
+- `appsettings.server-29.qa.example.json`：`10.5.32.29` QA；送往 `redhood67.infinitybeyonder888test.com`。包含 901 / 902 / 903 / QA，目前只有 901 開啟 BMS 傳送。
+- `appsettings.server-30.production.example.json`：`10.5.32.30` 正式主機；送往 `redhood67.infinitybeyonder888.com`。包含 901 / 902 / 903。
+- `appsettings.server-31.standby.example.json`：`10.5.32.31` 正式備援；設定與正式主機相同，但 systemd 平時必須保持停止與停用。
+
+正式與備援範本的 JWT Provider ID、Token Serial、Signing Key 及 SourceDataId 尚未取得，因此保留 `REPLACE_WITH_...` 或空白。部署前必須依正式 BMS 資料補齊；桌台主要對應欄位仍是 `sourceDataCode`（901 / 902 / 903）。
 
 目前已確認的 MOXA 對應另記錄於 `moxa-endpoints.pit9.json`：
 
@@ -61,11 +60,13 @@ sudo systemctl start angel-eye-bridge
 QA  -> 10.5.32.124:4001, NPort 5110, 9600 8N1 None
 ```
 
-正式區建議：
+部署對應：
 
-- Server-1：複製 `appsettings.example.json` 為 `/etc/angel-eye-bridge/appsettings.json` 後啟用服務。
-- Server-2：同設定先放好，但 service 保持停止，作為備援。
-- Server-3：複製 `appsettings.qa.example.json` 為 `/etc/angel-eye-bridge/appsettings.json`，先測 QA。
+- `10.5.32.29`：複製 `appsettings.server-29.qa.example.json` 為 `/etc/angel-eye-bridge/appsettings.json`。
+- `10.5.32.30`：複製 `appsettings.server-30.production.example.json` 為 `/etc/angel-eye-bridge/appsettings.json`，正式啟用服務。
+- `10.5.32.31`：複製 `appsettings.server-31.standby.example.json` 為 `/etc/angel-eye-bridge/appsettings.json`，但執行 `sudo systemctl disable --now angel-eye-bridge` 保持備援停止。
+
+備援切換時，必須先停止 `10.5.32.30` 的服務，再啟用 `10.5.32.31`，避免兩台同時讀取相同牌盒並重複送事件。
 
 同一張桌同一時間只能有一個 Bridge 服務連線，避免 BMS 收到重複牌訊。
 
@@ -81,11 +82,11 @@ QA  -> 10.5.32.124:4001, NPort 5110, 9600 8N1 None
 ```json
 {
   "deskName": "901桌",
-  "sourceDataCode": "ANGEL_BAC901",
+  "sourceDataCode": "901",
   "shoeId": "SHOE901",
   "currentShoe": 0,
   "currentRound": 1,
-  "moxaHost": "10.5.32.25",
+  "moxaHost": "10.5.32.24",
   "moxaPort": 4001
 }
 ```
