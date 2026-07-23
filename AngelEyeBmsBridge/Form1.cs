@@ -30,6 +30,7 @@ public partial class Form1 : Form
     private readonly Dictionary<ShoeEndpoint, BridgeOutboxStatus> _outboxStatuses = [];
     private readonly Dictionary<ShoeEndpoint, PendingNextRoundCountdown> _pendingNextRoundCountdowns = [];
     private readonly HashSet<string> _handledBmsCommandIds = [];
+    private readonly RecoverRoundBackoffTracker _recoverRoundBackoff = new();
     private bool _autoRunTickInProgress;
     private bool _outboxStatusRefreshInProgress;
 
@@ -4548,6 +4549,13 @@ public partial class Form1 : Form
             return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
         }
 
+        RecoverRoundBackoffDecision backoffDecision = _recoverRoundBackoff.GetDecision(command, DateTimeOffset.UtcNow);
+        if (!backoffDecision.ShouldAttempt)
+        {
+            return BridgeCommandHandlingResult.Deferred(
+                $"GameResult {command.Shoe}/{command.Round} was not found locally; retry after {FormatRetryDelay(backoffDecision.Delay)}.");
+        }
+
         BridgeEventQuery query = new()
         {
             Type = "GameResult",
@@ -4564,13 +4572,21 @@ public partial class Form1 : Form
             .ConfigureAwait(false);
         if (count <= 0)
         {
-            AppendLog(endpoint, "API", $"BMS 補償要求找不到 GameResult {command.Shoe}/{command.Round}。");
+            RecoverRoundBackoffDecision retryDecision = _recoverRoundBackoff.RecordNotFound(command, DateTimeOffset.UtcNow);
+            AppendLog(endpoint, "API", $"BMS 補償要求找不到 GameResult {command.Shoe}/{command.Round}，{FormatRetryDelay(retryDecision.Delay)} 後重試。");
             return BridgeCommandHandlingResult.NotFound($"GameResult {command.Shoe}/{command.Round} was not found locally.");
         }
 
+        _recoverRoundBackoff.Clear(command);
         AppendLog(endpoint, "API", $"BMS 補償要求已重新排送 GameResult {command.Shoe}/{command.Round}。");
         _ = RefreshOutboxStatusesAsync();
         return BridgeCommandHandlingResult.Handled($"Requeued {count} GameResult event(s).");
+    }
+
+    private static string FormatRetryDelay(TimeSpan delay)
+    {
+        int seconds = Math.Max(1, (int)Math.Ceiling(delay.TotalSeconds));
+        return $"{seconds.ToString(CultureInfo.InvariantCulture)} 秒";
     }
 
     private async Task<BridgeCommandHandlingResult> HandleResendEventCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)

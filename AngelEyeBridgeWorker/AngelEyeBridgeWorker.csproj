@@ -16,6 +16,7 @@
     <Compile Include="..\AngelEyeBmsBridge\BridgeGameNumbering.cs" Link="Shared\BridgeGameNumbering.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeSettings.cs" Link="Shared\BridgeSettings.cs" />
     <Compile Include="..\AngelEyeBmsBridge\JwtTokenGenerator.cs" Link="Shared\JwtTokenGenerator.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\RecoverRoundBackoffTracker.cs" Link="Shared\RecoverRoundBackoffTracker.cs" />
     <Compile Include="..\AngelEyeBmsBridge\SerialListener.cs" Link="Shared\SerialListener.cs" />
     <Compile Include="..\AngelEyeBmsBridge\ShoeEndpoint.cs" Link="Shared\ShoeEndpoint.cs" />
   </ItemGroup>

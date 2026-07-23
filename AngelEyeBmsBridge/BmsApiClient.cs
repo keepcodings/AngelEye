@@ -302,11 +302,22 @@ public sealed class BmsApiClient : IDisposable
             return nextDelay;
         }
 
-        OnLogReceived?.Invoke($"BMS 補償查詢收到 {commands.Count} 筆補送命令。");
+        bool loggedCommandHeader = false;
         foreach (AngelBridgeCommand command in commands)
         {
             cancellationToken.ThrowIfCancellationRequested();
             BridgeCommandHandlingResult result = await HandleCommandAsync(command, cancellationToken).ConfigureAwait(false);
+            if (string.Equals(result.Status, "Deferred", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!loggedCommandHeader)
+            {
+                OnLogReceived?.Invoke($"BMS 補償查詢收到 {commands.Count} 筆補送命令。");
+                loggedCommandHeader = true;
+            }
+
             string status = result.Success ? "完成" : "未完成";
             OnLogReceived?.Invoke($"BMS 命令 {command.Type}({command.CommandId}) {status}: {result.Message}");
         }
@@ -644,6 +655,11 @@ public sealed record BridgeCommandHandlingResult(bool Success, string Status, st
     /// <param name="message">Human-readable result detail.</param>
     /// <returns>A not-found command result.</returns>
     public static BridgeCommandHandlingResult NotFound(string message) => new(false, "NotFound", message);
+
+    /// <summary>Creates a deferred result for commands that are intentionally waiting for their next local retry window.</summary>
+    /// <param name="message">Human-readable result detail.</param>
+    /// <returns>A deferred command result.</returns>
+    public static BridgeCommandHandlingResult Deferred(string message) => new(false, "Deferred", message);
 
     /// <summary>Creates a rejected result.</summary>
     /// <param name="message">Human-readable result detail.</param>

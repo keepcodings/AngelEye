@@ -22,6 +22,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private readonly HashSet<string> _publishedStartGames = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _handledBmsCommandIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ShoeEndpoint, CancellationTokenSource> _pendingNextRoundCountdowns = [];
+    private readonly RecoverRoundBackoffTracker _recoverRoundBackoff = new();
     private readonly object _roundGate = new();
     private readonly object _commandGate = new();
     private long _eventSequence;
@@ -655,6 +656,13 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
         }
 
+        RecoverRoundBackoffDecision backoffDecision = _recoverRoundBackoff.GetDecision(command, DateTimeOffset.UtcNow);
+        if (!backoffDecision.ShouldAttempt)
+        {
+            return BridgeCommandHandlingResult.Deferred(
+                $"GameResult {command.Shoe}/{command.Round} was not found locally; retry after {FormatRetryDelay(backoffDecision.Delay)}.");
+        }
+
         BridgeEventQuery query = new()
         {
             Type = "GameResult",
@@ -671,13 +679,21 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             .ConfigureAwait(false);
         if (count <= 0)
         {
-            Log(endpoint, "API", $"BMS 補償要求找不到 GameResult {command.Shoe}/{command.Round}。");
+            RecoverRoundBackoffDecision retryDecision = _recoverRoundBackoff.RecordNotFound(command, DateTimeOffset.UtcNow);
+            Log(endpoint, "API", $"BMS 補償要求找不到 GameResult {command.Shoe}/{command.Round}，{FormatRetryDelay(retryDecision.Delay)} 後重試。");
             return BridgeCommandHandlingResult.NotFound($"GameResult {command.Shoe}/{command.Round} was not found locally.");
         }
 
+        _recoverRoundBackoff.Clear(command);
         Log(endpoint, "API", $"BMS 補償要求已重新排送 GameResult {command.Shoe}/{command.Round}。");
         _ = RefreshOutboxStatusesAsync();
         return BridgeCommandHandlingResult.Handled($"Requeued {count} GameResult event(s).");
+    }
+
+    private static string FormatRetryDelay(TimeSpan delay)
+    {
+        int seconds = Math.Max(1, (int)Math.Ceiling(delay.TotalSeconds));
+        return $"{seconds.ToString(CultureInfo.InvariantCulture)} 秒";
     }
 
     private async Task<BridgeCommandHandlingResult> HandleResendEventCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
