@@ -11,12 +11,14 @@
 
   <ItemGroup>
     <Compile Include="..\AngelEyeBmsBridge\AngelEyeProtocol.cs" Link="Shared\AngelEyeProtocol.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\AngelEyeFrameDecoder.cs" Link="Shared\AngelEyeFrameDecoder.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BmsApiClient.cs" Link="Shared\BmsApiClient.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeEventJournal.cs" Link="Shared\BridgeEventJournal.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeJournalQueries.cs" Link="Shared\BridgeJournalQueries.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeGameNumbering.cs" Link="Shared\BridgeGameNumbering.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeSettings.cs" Link="Shared\BridgeSettings.cs" />
     <Compile Include="..\AngelEyeBmsBridge\JwtTokenGenerator.cs" Link="Shared\JwtTokenGenerator.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\MoxaLiveMonitor.cs" Link="Shared\MoxaLiveMonitor.cs" />
     <Compile Include="..\AngelEyeBmsBridge\RecoverRoundBackoffTracker.cs" Link="Shared\RecoverRoundBackoffTracker.cs" />
     <Compile Include="..\AngelEyeBmsBridge\SerialListener.cs" Link="Shared\SerialListener.cs" />
     <Compile Include="..\AngelEyeBmsBridge\ShoeEndpoint.cs" Link="Shared\ShoeEndpoint.cs" />

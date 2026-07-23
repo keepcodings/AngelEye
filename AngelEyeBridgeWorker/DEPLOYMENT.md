@@ -7,7 +7,7 @@
 
 三台 TeleBet VM 使用同一套程式，各自放對應角色的設定檔；服務名稱都使用 `angel-eye-bridge.service`。
 
-Windows `AngelEyeBmsBridge.exe` 無參數時是唯讀 Query Console；只有明確加上 `--engineering` 才進入原工程介面。Query Console 不直接連 MOXA、不開啟 Worker journal，也不送 BMS POST。
+Windows `AngelEyeBmsBridge.exe` 無參數時是唯讀 Query Console；只有明確加上 `--engineering` 才進入原工程介面。Query Console 的 Worker 查詢頁不開啟 Worker journal，也不送 BMS POST；「MOXA 即時監看」只有操作員明確按開始後才建立額外的 receive-only 連線。
 
 ## 目錄
 
@@ -70,7 +70,22 @@ QA  -> 10.5.32.124:4001, NPort 5110, 9600 8N1 None
 
 備援切換時，必須先停止 `10.5.32.30` 的服務，再啟用 `10.5.32.31`，避免兩台同時讀取相同牌盒並重複送事件。
 
-同一張桌同一時間只能有一個 Bridge 服務連線，避免 BMS 收到重複牌訊。
+同一張桌同一時間只能有一個 **Worker／Bridge sender**，避免 BMS 收到重複牌訊。NPort 現場已確認可同時接受 4 條連線，因此可另有 Query Console 的唯讀監看連線；監看連線不會送牌盒命令、寫 SQLite 或 POST BMS。
+
+## Query Console 的 MOXA 即時監看
+
+「MOXA 即時監看」與 Worker 查詢是兩條獨立資料來源：
+
+- 程式啟動時不會自動連 MOXA；先選取 901、902、903 或 QA，再按「開始監看選取桌台」。
+- 每個 Query Console process 對每個 endpoint 最多使用 1 條連線。四桌全部開始時共使用 4 條；同一桌重複按開始不會增加 socket。
+- endpoint 固定為 901 `10.5.32.24:4001`、902 `10.5.32.25:4001`、903 `10.5.32.26:4001`、QA `10.5.32.124:4001`，GUI 不提供任意主機設定。
+- 頁面固定顯示「MOXA 直連／session-local／不送 BMS」。它只接收與解析 frame，沒有 write、Lock、Unlock、ClearError、GP、重送、journal 或 BMS client。
+- `Partial` 表示本次 session 可能從牌局中途加入、曾漏序號或剛完成重連；這時牌面只能當現場診斷線索，不可當正式完整牌局。收到可判定的切牌邊界並保持連續後，才顯示「連續」。
+- `Session age` 是本次按開始後的時間，`Last frame` 是最近收到資料的時間；RX 只保留最近 200 筆，`Dropped` 顯示被淘汰的舊列數。
+- 不使用時選取桌台並按「停止監看選取桌台」。關閉 Query Console 會停止並釋放全部監看連線。
+- Worker 仍是唯一 BMS sender。Worker 頁面的靴／局／Event ID／Outbox 證據，不會由 MOXA monitor 建立或修改。
+
+若監看功能影響現場連線額度，可立即停止該桌監看；不需停止 Worker。若要回復舊 GUI，替換回舊版 Windows exe 即可，monitor 沒有資料庫 migration 或持久化資料需要回復。
 
 ## Query Console migration 上線順序
 

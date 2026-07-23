@@ -16,6 +16,7 @@
 - 現場電腦規格、遠端工具、admin 權限、資料夾建立、Windows Service 安裝 / 更新 / 移除、outbound HTTPS、防火牆 / 白名單 / proxy 調整，均依現場申請流程辦理，可比照既有攝影棚規格規劃。
 - 對方可視為非技術窗口；涉及協定細節的問題，不以口頭回覆作為最終依據，需以規格書、raw frame、遠端實機測試結果確認。
 - 第一版正式模式採 read-only。Bridge 預設不對實體牌盒送 PC operation command；若有特殊現場測試需求，需啟用內部工程授權。
+- NPort 現場確認可同時接受 4 條連線。Windows Query Console 的「MOXA 即時監看」可在操作員明確開始後，為選取桌台建立一條額外 receive-only 連線；Worker／Bridge sender 仍維持唯一，monitor 不送牌盒命令、不寫 Outbox、不送 BMS。
 - 目前工程授權密碼為 `a84268426`。此密碼只用於 GUI 允許對實體牌盒送 `OP` 命令；正式上線前若資安要求更高，應改為受保護設定或部署時輪替。
 - 依目前 PDF 初判，牌盒不會提供 BMS 可直接使用的桌號、靴號、局號或局唯一識別；Bridge 先自行維護靴號 / 局號，後續以遠端實機 raw frame 驗證是否有額外欄位。
 
@@ -85,6 +86,17 @@ flowchart LR
 ---
 
 ## 2. GUI 設定
+
+### 2.0 Query Console 的 MOXA 即時監看
+
+Windows 程式無參數啟動時是營運查詢台。既有總覽、牌局、異常與技術資料頁只讀取 Worker GET API；新增的「MOXA 即時監看」是另一個明確標示來源的 session-local 診斷頁。
+
+- 啟動程式時為零 MOXA monitor socket；選桌後按「開始監看選取桌台」才連線，同桌重複開始不增加連線。
+- 901、902、903、QA 分別固定使用 `10.5.32.24:4001`、`.25:4001`、`.26:4001`、`.124:4001`。
+- `Partial` 代表可能從牌局中途加入、漏 frame 或重連，牌面不可視為完整官方紀錄；切牌邊界後連續接收才解除。
+- 畫面顯示 Player／Banker cards、GameResult、G／C 計數、錯誤、session／last-frame age、最近 200 筆 RX 與 dropped count。
+- monitor transport 只有 connect／receive／stop／dispose，沒有 Lock、Unlock、ClearError、GP、resend、設定、journal 或 BMS POST。
+- 按停止或關閉程式即釋放連線；Worker 仍是唯一 BMS sender，正式靴號、局號、Round ID 與傳送證據仍只看 Worker 頁。
 
 ### 2.1 BMS 事件 API
 

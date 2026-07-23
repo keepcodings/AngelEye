@@ -9,6 +9,8 @@ public sealed class QueryConsoleForm : Form
     private readonly TeleBetQueryClient _client = new();
     private readonly QueryConsoleState _state = new();
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 5000 };
+    private readonly System.Windows.Forms.Timer _moxaRefreshTimer = new() { Interval = 250 };
+    private readonly MoxaMonitorManager _moxaMonitor = new();
     private readonly ComboBox _profile = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 155 };
     private readonly Label _sourceBanner = new() { Text = "來源尚未確認", AutoSize = true, Font = new Font("Microsoft JhengHei", 11F, FontStyle.Bold), ForeColor = Color.Gold, Margin = new Padding(12, 6, 0, 0) };
     private readonly Label _connectionBanner = new()
@@ -28,6 +30,8 @@ public sealed class QueryConsoleForm : Form
     private readonly DataGridView _events = CreateGrid();
     private readonly DataGridView _outbox = CreateGrid();
     private readonly DataGridView _recoveries = CreateGrid();
+    private readonly DataGridView _moxaEndpoints = CreateGrid();
+    private readonly DataGridView _moxaReceive = CreateGrid();
     private readonly TextBox _roundDetail = CreateReadOnlyTextBox();
     private readonly TextBox _payload = CreateReadOnlyTextBox();
     private readonly DateTimePicker _fromDate = new() { Format = DateTimePickerFormat.Short, Width = 115 };
@@ -74,6 +78,8 @@ public sealed class QueryConsoleForm : Form
         _rounds.SelectionChanged += async (_, _) => await LoadSelectedRoundDetailAsync();
         _events.SelectionChanged += (_, _) => ShowSelectedPayload();
         _refreshTimer.Tick += async (_, _) => await RefreshStatusAsync();
+        _moxaRefreshTimer.Tick += (_, _) => RefreshMoxaMonitor();
+        _moxaEndpoints.SelectionChanged += (_, _) => RefreshMoxaReceiveRows();
         if (autoStartQueries)
         {
             Shown += async (_, _) =>
@@ -81,14 +87,21 @@ public sealed class QueryConsoleForm : Form
                 await RefreshStatusAsync();
                 await SearchRoundsAsync(reset: true);
                 _refreshTimer.Start();
+                _moxaRefreshTimer.Start();
             };
+        }
+        else
+        {
+            _moxaRefreshTimer.Start();
         }
         FormClosing += (_, _) =>
         {
             _closing = true;
             _refreshTimer.Stop();
+            _moxaRefreshTimer.Stop();
             _client.Dispose();
         };
+        FormClosed += async (_, _) => await _moxaMonitor.DisposeAsync();
     }
 
     private QueryServerProfile SelectedProfile => _profile.SelectedItem as QueryServerProfile ?? QueryServerProfile.Defaults[0];
@@ -159,6 +172,7 @@ public sealed class QueryConsoleForm : Form
         tabs.TabPages.Add(BuildDashboardTab());
         tabs.TabPages.Add(BuildRoundsTab());
         tabs.TabPages.Add(BuildExceptionsTab());
+        tabs.TabPages.Add(BuildMoxaMonitorTab());
         tabs.TabPages.Add(BuildTechnicalTab());
         tabs.SelectedIndexChanged += async (_, _) =>
         {
@@ -190,6 +204,108 @@ public sealed class QueryConsoleForm : Form
         });
         tab.Controls.Add(_dashboard);
         tab.Controls.Add(note);
+        return tab;
+    }
+
+    private TabPage BuildMoxaMonitorTab()
+    {
+        TabPage tab = NewTab("MOXA 即時監看");
+        tab.Name = "MoxaLiveMonitorTab";
+
+        Panel provenance = new()
+        {
+            Dock = DockStyle.Top,
+            Height = 48,
+            Padding = new Padding(10),
+            BackColor = Color.FromArgb(255, 248, 225)
+        };
+        provenance.Controls.Add(new Label
+        {
+            Name = "MoxaProvenanceLabel",
+            Dock = DockStyle.Fill,
+            Text = "MOXA 直連／session-local／不送 BMS。資料只代表本次開始監看後收到的封包；Partial 表示可能缺少先前牌面。",
+            ForeColor = Color.FromArgb(112, 75, 0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Microsoft JhengHei", 10F, FontStyle.Bold)
+        });
+
+        FlowLayoutPanel actions = new()
+        {
+            Dock = DockStyle.Top,
+            Height = 46,
+            Padding = new Padding(8, 7, 8, 5),
+            BackColor = Color.White,
+            WrapContents = false
+        };
+        Button start = new()
+        {
+            Name = "StartMoxaMonitorButton",
+            Text = "開始監看選取桌台",
+            Width = 145,
+            Height = 29
+        };
+        Button stop = new()
+        {
+            Name = "StopMoxaMonitorButton",
+            Text = "停止監看選取桌台",
+            Width = 145,
+            Height = 29
+        };
+        Label budget = new()
+        {
+            AutoSize = true,
+            Text = "每桌最多 1 條唯讀連線；程式啟動時不自動連線",
+            ForeColor = Color.DimGray,
+            Margin = new Padding(14, 7, 0, 0)
+        };
+        start.Click += (_, _) =>
+        {
+            string? desk = SelectedMoxaDesk();
+            if (desk is not null)
+            {
+                _ = _moxaMonitor.StartAsync(desk);
+                RefreshMoxaMonitor();
+            }
+        };
+        stop.Click += async (_, _) =>
+        {
+            string? desk = SelectedMoxaDesk();
+            if (desk is not null)
+            {
+                await _moxaMonitor.StopAsync(desk);
+                RefreshMoxaMonitor();
+            }
+        };
+        actions.Controls.Add(start);
+        actions.Controls.Add(stop);
+        actions.Controls.Add(budget);
+
+        SplitContainer content = new()
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterDistance = 330
+        };
+        GroupBox endpointGroup = new()
+        {
+            Dock = DockStyle.Fill,
+            Text = "桌台連線與本次 session 牌面",
+            Padding = new Padding(8)
+        };
+        endpointGroup.Controls.Add(_moxaEndpoints);
+        GroupBox receiveGroup = new()
+        {
+            Dock = DockStyle.Fill,
+            Text = "選取桌台 RX（最近 200 筆；超量淘汰最舊資料）",
+            Padding = new Padding(8)
+        };
+        receiveGroup.Controls.Add(_moxaReceive);
+        content.Panel1.Controls.Add(endpointGroup);
+        content.Panel2.Controls.Add(receiveGroup);
+
+        tab.Controls.Add(content);
+        tab.Controls.Add(actions);
+        tab.Controls.Add(provenance);
         return tab;
     }
 
@@ -313,7 +429,117 @@ public sealed class QueryConsoleForm : Form
         AddColumns(_events, ["Event ID", "時間", "類型", "桌台", "靴號", "局號", "狀態", "HTTP", "重試", "錯誤"]);
         AddColumns(_outbox, ["Event ID", "時間", "類型", "桌台", "靴／局", "狀態", "HTTP", "重試", "下次重試", "錯誤"]);
         AddColumns(_recoveries, ["Command ID", "類型", "桌台", "靴／局", "結果", "收到時間", "最近觀測", "下次重試", "訊息"]);
+        _moxaEndpoints.Name = "MoxaEndpointGrid";
+        _moxaReceive.Name = "MoxaReceiveGrid";
+        AddColumns(_moxaEndpoints,
+        [
+            "桌台", "MOXA endpoint", "連線", "Session age", "Last frame",
+            "證據", "Player", "Banker", "GameResult", "G / C", "錯誤", "Dropped"
+        ]);
+        AddColumns(_moxaReceive, ["時間", "類型", "訊息"]);
+        RefreshMoxaMonitor();
     }
+
+    private void RefreshMoxaMonitor()
+    {
+        if (_closing || IsDisposed)
+        {
+            return;
+        }
+
+        string? selectedDesk = SelectedMoxaDesk();
+        _moxaEndpoints.SuspendLayout();
+        _moxaEndpoints.Rows.Clear();
+        foreach (MoxaMonitorSession session in _moxaMonitor.Sessions)
+        {
+            MoxaMonitorSnapshot snapshot = session.Snapshot;
+            int rowIndex = _moxaEndpoints.Rows.Add(
+                snapshot.Endpoint.Desk,
+                snapshot.Endpoint.Key,
+                MoxaStateText(snapshot.State),
+                Age(snapshot.SessionStartedAt),
+                Age(snapshot.LastFrameAt),
+                snapshot.Partial ? "Partial" : "連續",
+                string.Join(" ", snapshot.PlayerCards),
+                string.Join(" ", snapshot.BankerCards),
+                string.IsNullOrEmpty(snapshot.GameResult) ? "-" : snapshot.GameResult,
+                $"{snapshot.GameResultCount} / {snapshot.CutCardCount}",
+                string.IsNullOrEmpty(snapshot.Error) ? "-" : snapshot.Error,
+                snapshot.DroppedDiagnostics);
+            DataGridViewRow row = _moxaEndpoints.Rows[rowIndex];
+            row.Tag = snapshot.Endpoint.Desk;
+            if (snapshot.Partial)
+            {
+                row.Cells[5].Style.ForeColor = Color.DarkOrange;
+                row.Cells[5].Style.Font = new Font(_moxaEndpoints.Font, FontStyle.Bold);
+            }
+            if (snapshot.State is MoxaMonitorConnectionState.Failed or MoxaMonitorConnectionState.Backoff)
+            {
+                row.Cells[2].Style.ForeColor = Color.Firebrick;
+            }
+        }
+        _moxaEndpoints.ResumeLayout();
+
+        if (_moxaEndpoints.Rows.Count > 0)
+        {
+            DataGridViewRow? rowToSelect = _moxaEndpoints.Rows
+                .Cast<DataGridViewRow>()
+                .FirstOrDefault(row =>
+                    string.Equals(row.Tag as string, selectedDesk, StringComparison.OrdinalIgnoreCase))
+                ?? _moxaEndpoints.Rows[0];
+            rowToSelect.Selected = true;
+            _moxaEndpoints.CurrentCell = rowToSelect.Cells[0];
+        }
+        RefreshMoxaReceiveRows();
+    }
+
+    private void RefreshMoxaReceiveRows()
+    {
+        if (_closing || IsDisposed)
+        {
+            return;
+        }
+
+        string? desk = SelectedMoxaDesk();
+        _moxaReceive.Rows.Clear();
+        if (desk is null)
+        {
+            return;
+        }
+
+        foreach (MoxaMonitorDiagnostic item in _moxaMonitor.Get(desk).Snapshot.Diagnostics)
+        {
+            _moxaReceive.Rows.Add(
+                item.At.ToLocalTime().ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture),
+                item.Kind,
+                item.Message);
+        }
+    }
+
+    private string? SelectedMoxaDesk() =>
+        _moxaEndpoints.CurrentRow?.Tag as string;
+
+    private static string Age(DateTimeOffset? timestamp)
+    {
+        if (!timestamp.HasValue)
+        {
+            return "-";
+        }
+        TimeSpan age = DateTimeOffset.UtcNow - timestamp.Value;
+        return age.TotalHours >= 1
+            ? $"{(int)age.TotalHours:00}:{age.Minutes:00}:{age.Seconds:00}"
+            : $"{age.Minutes:00}:{age.Seconds:00}";
+    }
+
+    private static string MoxaStateText(MoxaMonitorConnectionState state) => state switch
+    {
+        MoxaMonitorConnectionState.Stopped => "已停止",
+        MoxaMonitorConnectionState.Connecting => "連線中",
+        MoxaMonitorConnectionState.Live => "Live",
+        MoxaMonitorConnectionState.Backoff => "等待重連",
+        MoxaMonitorConnectionState.Failed => "失敗",
+        _ => state.ToString()
+    };
 
     private async Task RefreshAllAsync()
     {

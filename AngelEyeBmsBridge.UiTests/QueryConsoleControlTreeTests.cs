@@ -19,6 +19,7 @@ public sealed class QueryConsoleControlTreeTests
             Assert.Contains("總覽", tabs);
             Assert.Contains("牌局查詢", tabs);
             Assert.Contains("異常中心", tabs);
+            Assert.Contains("MOXA 即時監看", tabs);
             Assert.Contains("技術資料（唯讀）", tabs);
             Assert.Contains("Events / Payload", tabs);
             Assert.Contains("Outbox", tabs);
@@ -26,6 +27,13 @@ public sealed class QueryConsoleControlTreeTests
 
             string[] forbidden = ["重送", "Lock", "Unlock", "鎖定", "解鎖", "清錯", "Clear", "Transmit", "傳送開關", "儲存設定", "主備切換"];
             Assert.DoesNotContain(buttons, text => forbidden.Any(term => text.Contains(term, StringComparison.OrdinalIgnoreCase)));
+            Assert.Contains("開始監看選取桌台", buttons);
+            Assert.Contains("停止監看選取桌台", buttons);
+            Label provenance = Assert.Single(controls.OfType<Label>()
+                .Where(label => label.Name == "MoxaProvenanceLabel"));
+            Assert.Contains("MOXA 直連", provenance.Text);
+            Assert.Contains("session-local", provenance.Text);
+            Assert.Contains("不送 BMS", provenance.Text);
             Assert.All(controls.OfType<TextBox>().Where(textBox => textBox.Multiline), textBox => Assert.True(textBox.ReadOnly));
         });
     }
