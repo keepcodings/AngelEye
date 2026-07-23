@@ -1,13 +1,14 @@
 using Microsoft.Data.Sqlite;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace AngelEyeBmsBridge;
 
 /// <summary>
 /// Maintains the local SQLite event journal and retry outbox for bridge-to-BMS delivery.
 /// </summary>
-public sealed class BridgeEventJournal
+public sealed partial class BridgeEventJournal
 {
     private long _nextEventId;
 
@@ -43,7 +44,9 @@ public sealed class BridgeEventJournal
 
         await using SqliteConnection connection = CreateConnection();
         await connection.OpenAsync().ConfigureAwait(false);
+        using SqliteTransaction transaction = connection.BeginTransaction();
         await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO bridge_events
                 (event_id, occurred_utc, type, source, desk_id, device_id, shoe, round, round_id, payload_json)
@@ -65,7 +68,283 @@ public sealed class BridgeEventJournal
         command.Parameters.AddWithValue("$payload_json", payloadJson);
 
         await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+        await UpdateRoundProjectionAsync(connection, transaction, payload, payloadJson, eventId).ConfigureAwait(false);
+        await transaction.CommitAsync().ConfigureAwait(false);
         return eventId;
+    }
+
+    private static async Task UpdateRoundProjectionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Dictionary<string, object?> payload,
+        string payloadJson,
+        long eventId)
+    {
+        string type = GetString(payload, "type");
+        if (type is not ("StartGame" or "CardDrawn" or "GameResult"))
+        {
+            return;
+        }
+
+        string deskId = GetString(payload, "sourceDataCode");
+        string deviceId = GetString(payload, "deviceId", GetString(payload, "shoeId"));
+        long shoe = GetInt64(payload, "shoe");
+        long round = GetInt64(payload, "round");
+        long? roundId = GetNullableInt64(payload, "roundId");
+        string occurredUtc = NormalizeUtcText(GetString(payload, "timestamp"));
+
+        using JsonDocument document = JsonDocument.Parse(payloadJson);
+        JsonElement data = document.RootElement.TryGetProperty("data", out JsonElement dataElement)
+            ? dataElement
+            : default;
+
+        if (type == "StartGame")
+        {
+            string startedUtc = data.ValueKind == JsonValueKind.Object &&
+                data.TryGetProperty("startTime", out JsonElement startTimeElement)
+                    ? NormalizeUtcText(startTimeElement.GetString() ?? occurredUtc)
+                    : occurredUtc;
+            await UpsertStartGameAsync(
+                connection,
+                transaction,
+                deskId,
+                deviceId,
+                shoe,
+                round,
+                roundId,
+                startedUtc,
+                occurredUtc,
+                eventId).ConfigureAwait(false);
+            return;
+        }
+
+        if (type == "CardDrawn")
+        {
+            await UpsertCardDrawnAsync(
+                connection,
+                transaction,
+                deskId,
+                deviceId,
+                shoe,
+                round,
+                roundId,
+                occurredUtc,
+                eventId,
+                data).ConfigureAwait(false);
+            return;
+        }
+
+        string resultJson = data.ValueKind == JsonValueKind.Undefined ? "null" : data.GetRawText();
+        await UpsertGameResultAsync(
+            connection,
+            transaction,
+            deskId,
+            deviceId,
+            shoe,
+            round,
+            roundId,
+            occurredUtc,
+            eventId,
+            resultJson).ConfigureAwait(false);
+    }
+
+    private static async Task UpsertStartGameAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string deskId,
+        string deviceId,
+        long shoe,
+        long round,
+        long? roundId,
+        string startedUtc,
+        string updatedUtc,
+        long eventId)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO bridge_rounds
+                (desk_id, device_id, shoe, round, round_id, started_utc, state, start_event_id, updated_utc, is_complete)
+            VALUES
+                ($desk_id, $device_id, $shoe, $round, $round_id, $started_utc, 'Started', $event_id, $updated_utc, 0)
+            ON CONFLICT (desk_id, shoe, round) DO UPDATE SET
+                device_id = excluded.device_id,
+                round_id = COALESCE(bridge_rounds.round_id, excluded.round_id),
+                started_utc = COALESCE(bridge_rounds.started_utc, excluded.started_utc),
+                start_event_id = COALESCE(bridge_rounds.start_event_id, excluded.start_event_id),
+                state = CASE WHEN bridge_rounds.is_complete = 1 THEN bridge_rounds.state ELSE 'Started' END,
+                updated_utc = CASE WHEN bridge_rounds.updated_utc > excluded.updated_utc THEN bridge_rounds.updated_utc ELSE excluded.updated_utc END;
+            """;
+        AddRoundIdentityParameters(command, deskId, deviceId, shoe, round, roundId);
+        command.Parameters.AddWithValue("$started_utc", startedUtc);
+        command.Parameters.AddWithValue("$updated_utc", updatedUtc);
+        command.Parameters.AddWithValue("$event_id", eventId);
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+    }
+
+    private static async Task UpsertCardDrawnAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string deskId,
+        string deviceId,
+        long shoe,
+        long round,
+        long? roundId,
+        string occurredUtc,
+        long eventId,
+        JsonElement data)
+    {
+        List<BridgeRoundCardProjection> cards = await ReadProjectedCardsAsync(connection, transaction, deskId, shoe, round).ConfigureAwait(false);
+        string target = ReadJsonString(data, "target");
+        int index = ReadJsonInt32(data, "index");
+        BridgeRoundCardProjection card = new(
+            target,
+            index,
+            ReadJsonString(data, "suit"),
+            ReadJsonString(data, "value"),
+            eventId,
+            occurredUtc);
+
+        cards.RemoveAll(existing =>
+            string.Equals(existing.Target, target, StringComparison.OrdinalIgnoreCase) && existing.Index == index);
+        cards.Add(card);
+        cards.Sort(static (left, right) => left.EventId.CompareTo(right.EventId));
+        string cardsJson = JsonSerializer.Serialize(cards);
+
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO bridge_rounds
+                (desk_id, device_id, shoe, round, round_id, state, cards_json, updated_utc, is_complete)
+            VALUES
+                ($desk_id, $device_id, $shoe, $round, $round_id, 'Dealing', $cards_json, $updated_utc, 0)
+            ON CONFLICT (desk_id, shoe, round) DO UPDATE SET
+                device_id = excluded.device_id,
+                round_id = COALESCE(bridge_rounds.round_id, excluded.round_id),
+                cards_json = excluded.cards_json,
+                state = CASE WHEN bridge_rounds.is_complete = 1 THEN bridge_rounds.state ELSE 'Dealing' END,
+                updated_utc = CASE WHEN bridge_rounds.updated_utc > excluded.updated_utc THEN bridge_rounds.updated_utc ELSE excluded.updated_utc END;
+            """;
+        AddRoundIdentityParameters(command, deskId, deviceId, shoe, round, roundId);
+        command.Parameters.AddWithValue("$cards_json", cardsJson);
+        command.Parameters.AddWithValue("$updated_utc", occurredUtc);
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+    }
+
+    private static async Task UpsertGameResultAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string deskId,
+        string deviceId,
+        long shoe,
+        long round,
+        long? roundId,
+        string occurredUtc,
+        long eventId,
+        string resultJson)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO bridge_rounds
+                (desk_id, device_id, shoe, round, round_id, settled_utc, state, result_json, result_event_id, updated_utc, is_complete)
+            VALUES
+                ($desk_id, $device_id, $shoe, $round, $round_id, $settled_utc, 'Settled', $result_json, $event_id, $updated_utc, 1)
+            ON CONFLICT (desk_id, shoe, round) DO UPDATE SET
+                device_id = excluded.device_id,
+                round_id = COALESCE(bridge_rounds.round_id, excluded.round_id),
+                settled_utc = excluded.settled_utc,
+                state = 'Settled',
+                result_json = excluded.result_json,
+                result_event_id = excluded.result_event_id,
+                updated_utc = CASE WHEN bridge_rounds.updated_utc > excluded.updated_utc THEN bridge_rounds.updated_utc ELSE excluded.updated_utc END,
+                is_complete = 1;
+            """;
+        AddRoundIdentityParameters(command, deskId, deviceId, shoe, round, roundId);
+        command.Parameters.AddWithValue("$settled_utc", occurredUtc);
+        command.Parameters.AddWithValue("$result_json", resultJson);
+        command.Parameters.AddWithValue("$updated_utc", occurredUtc);
+        command.Parameters.AddWithValue("$event_id", eventId);
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+    }
+
+    private static async Task<List<BridgeRoundCardProjection>> ReadProjectedCardsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string deskId,
+        long shoe,
+        long round)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT cards_json
+            FROM bridge_rounds
+            WHERE desk_id = $desk_id AND shoe = $shoe AND round = $round;
+            """;
+        command.Parameters.AddWithValue("$desk_id", deskId);
+        command.Parameters.AddWithValue("$shoe", shoe);
+        command.Parameters.AddWithValue("$round", round);
+        object? stored = await command.ExecuteScalarAsync().ConfigureAwait(false);
+        if (stored is not string json || string.IsNullOrWhiteSpace(json))
+        {
+            return [];
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<BridgeRoundCardProjection>>(json) ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static void AddRoundIdentityParameters(
+        SqliteCommand command,
+        string deskId,
+        string deviceId,
+        long shoe,
+        long round,
+        long? roundId)
+    {
+        command.Parameters.AddWithValue("$desk_id", deskId);
+        command.Parameters.AddWithValue("$device_id", deviceId);
+        command.Parameters.AddWithValue("$shoe", shoe);
+        command.Parameters.AddWithValue("$round", round);
+        command.Parameters.AddWithValue("$round_id", roundId.HasValue ? roundId.Value : DBNull.Value);
+    }
+
+    private static string ReadJsonString(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(propertyName, out JsonElement property))
+        {
+            return string.Empty;
+        }
+
+        return property.ValueKind == JsonValueKind.String ? property.GetString() ?? string.Empty : property.ToString();
+    }
+
+    private static int ReadJsonInt32(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(propertyName, out JsonElement property))
+        {
+            return 0;
+        }
+
+        return property.TryGetInt32(out int value) ? value : 0;
+    }
+
+    private static string NormalizeUtcText(string text)
+    {
+        return DateTimeOffset.TryParse(
+            text,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out DateTimeOffset parsed)
+            ? parsed.UtcDateTime.ToString("o", CultureInfo.InvariantCulture)
+            : text.Trim();
     }
 
     /// <summary>
@@ -198,11 +477,13 @@ public sealed class BridgeEventJournal
     /// </summary>
     /// <param name="eventId">Local event ID.</param>
     /// <param name="utcNow">Delivery time in UTC.</param>
-    public async Task MarkSentAsync(long eventId, DateTime utcNow)
+    public async Task MarkSentAsync(long eventId, DateTime utcNow, int? httpStatus = null)
     {
         await using SqliteConnection connection = CreateConnection();
         await connection.OpenAsync().ConfigureAwait(false);
+        using SqliteTransaction transaction = connection.BeginTransaction();
         await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             UPDATE bridge_events
             SET status = 'Sent',
@@ -215,6 +496,17 @@ public sealed class BridgeEventJournal
         command.Parameters.AddWithValue("$event_id", eventId);
         command.Parameters.AddWithValue("$now", utcNow.ToString("o", CultureInfo.InvariantCulture));
         await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+        await InsertDeliveryAttemptAsync(
+            connection,
+            transaction,
+            eventId,
+            utcNow,
+            succeeded: true,
+            httpStatus,
+            retryCount: null,
+            nextRetryUtc: null,
+            error: string.Empty).ConfigureAwait(false);
+        await transaction.CommitAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -224,13 +516,15 @@ public sealed class BridgeEventJournal
     /// <param name="retryCount">Updated retry count.</param>
     /// <param name="utcNow">Failure time in UTC.</param>
     /// <param name="error">Failure detail to store.</param>
-    public async Task MarkFailedAsync(long eventId, int retryCount, DateTime utcNow, string error)
+    public async Task MarkFailedAsync(long eventId, int retryCount, DateTime utcNow, string error, int? httpStatus = null)
     {
         DateTime nextRetry = utcNow.Add(CalculateBackoff(retryCount));
 
         await using SqliteConnection connection = CreateConnection();
         await connection.OpenAsync().ConfigureAwait(false);
+        using SqliteTransaction transaction = connection.BeginTransaction();
         await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             UPDATE bridge_events
             SET status = 'Failed',
@@ -245,7 +539,52 @@ public sealed class BridgeEventJournal
         command.Parameters.AddWithValue("$retry_count", retryCount);
         command.Parameters.AddWithValue("$now", utcNow.ToString("o", CultureInfo.InvariantCulture));
         command.Parameters.AddWithValue("$next_retry", nextRetry.ToString("o", CultureInfo.InvariantCulture));
-        command.Parameters.AddWithValue("$last_error", TrimForStore(error));
+        command.Parameters.AddWithValue("$last_error", RedactForStore(error));
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+        await InsertDeliveryAttemptAsync(
+            connection,
+            transaction,
+            eventId,
+            utcNow,
+            succeeded: false,
+            httpStatus,
+            retryCount,
+            nextRetry,
+            error).ConfigureAwait(false);
+        await transaction.CommitAsync().ConfigureAwait(false);
+    }
+
+    private static async Task InsertDeliveryAttemptAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long eventId,
+        DateTime attemptedUtc,
+        bool succeeded,
+        int? httpStatus,
+        int? retryCount,
+        DateTime? nextRetryUtc,
+        string error)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO bridge_delivery_attempts
+                (event_id, attempted_utc, succeeded, http_status, retry_count, next_retry_utc, error)
+            SELECT event_id, $attempted_utc, $succeeded, $http_status,
+                   COALESCE($retry_count, retry_count), $next_retry_utc, $error
+            FROM bridge_events
+            WHERE event_id = $event_id;
+            """;
+        command.Parameters.AddWithValue("$event_id", eventId);
+        command.Parameters.AddWithValue("$attempted_utc", attemptedUtc.ToString("o", CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$succeeded", succeeded ? 1 : 0);
+        command.Parameters.AddWithValue("$http_status", httpStatus.HasValue ? httpStatus.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$retry_count", retryCount.HasValue ? retryCount.Value : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "$next_retry_utc",
+            nextRetryUtc.HasValue ? nextRetryUtc.Value.ToString("o", CultureInfo.InvariantCulture) : DBNull.Value);
+        string redactedError = RedactForStore(error);
+        command.Parameters.AddWithValue("$error", string.IsNullOrWhiteSpace(redactedError) ? DBNull.Value : redactedError);
         await command.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
 
@@ -271,7 +610,7 @@ public sealed class BridgeEventJournal
             """;
         command.Parameters.AddWithValue("$event_id", eventId);
         command.Parameters.AddWithValue("$now", utcNow.ToString("o", CultureInfo.InvariantCulture));
-        command.Parameters.AddWithValue("$reason", TrimForStore(reason));
+        command.Parameters.AddWithValue("$reason", RedactForStore(reason));
         return await command.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
 
@@ -310,9 +649,60 @@ public sealed class BridgeEventJournal
             );
             """;
         command.Parameters.AddWithValue("$now", utcNow.ToString("o", CultureInfo.InvariantCulture));
-        command.Parameters.AddWithValue("$reason", TrimForStore(reason));
+        command.Parameters.AddWithValue("$reason", RedactForStore(reason));
         command.Parameters.AddWithValue("$limit", Math.Clamp(query.Limit, 1, 500));
         return await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Persists the latest observed decision for a BMS recovery or resend command.</summary>
+    public async Task RecordRecoveryRequestAsync(BridgeRecoveryAudit audit)
+    {
+        await using SqliteConnection connection = CreateConnection();
+        await connection.OpenAsync().ConfigureAwait(false);
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO bridge_recovery_requests
+                (command_id, command_type, desk_id, device_id, shoe, round, round_id,
+                 received_utc, last_observed_utc, result, next_retry_utc, message)
+            VALUES
+                ($command_id, $command_type, $desk_id, $device_id, $shoe, $round, $round_id,
+                 $received_utc, $last_observed_utc, $result, $next_retry_utc, $message)
+            ON CONFLICT (command_id) DO UPDATE SET
+                last_observed_utc = excluded.last_observed_utc,
+                result = CASE
+                    WHEN excluded.result = 'Requeued' THEN excluded.result
+                    WHEN bridge_recovery_requests.result IN ('Requeued', 'Rejected') THEN bridge_recovery_requests.result
+                    ELSE excluded.result
+                END,
+                next_retry_utc = CASE
+                    WHEN excluded.result = 'Requeued' THEN NULL
+                    WHEN bridge_recovery_requests.result IN ('Requeued', 'Rejected') THEN bridge_recovery_requests.next_retry_utc
+                    ELSE excluded.next_retry_utc
+                END,
+                message = CASE
+                    WHEN excluded.result = 'Requeued' THEN excluded.message
+                    WHEN bridge_recovery_requests.result IN ('Requeued', 'Rejected') THEN bridge_recovery_requests.message
+                    ELSE excluded.message
+                END;
+            """;
+        command.Parameters.AddWithValue("$command_id", audit.CommandId);
+        command.Parameters.AddWithValue("$command_type", audit.CommandType);
+        command.Parameters.AddWithValue("$desk_id", audit.SourceDataCode);
+        command.Parameters.AddWithValue("$device_id", audit.DeviceId);
+        command.Parameters.AddWithValue("$shoe", audit.Shoe.HasValue ? audit.Shoe.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$round", audit.Round.HasValue ? audit.Round.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$round_id", audit.RoundId.HasValue ? audit.RoundId.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$received_utc", audit.ReceivedUtc.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$last_observed_utc", audit.ObservedUtc.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$result", audit.Result);
+        command.Parameters.AddWithValue(
+            "$next_retry_utc",
+            audit.NextRetryUtc.HasValue
+                ? audit.NextRetryUtc.Value.UtcDateTime.ToString("o", CultureInfo.InvariantCulture)
+                : DBNull.Value);
+        string message = RedactForStore(audit.Message);
+        command.Parameters.AddWithValue("$message", string.IsNullOrWhiteSpace(message) ? DBNull.Value : message);
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -422,6 +812,56 @@ public sealed class BridgeEventJournal
         EnsureColumn(connection, "bridge_events", "sent_utc", "sent_utc TEXT NULL");
         EnsureColumn(connection, "bridge_events", "last_error", "last_error TEXT NULL");
         ExecuteNonQuery(connection, """
+            CREATE TABLE IF NOT EXISTS bridge_rounds
+            (
+                desk_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                shoe INTEGER NOT NULL,
+                round INTEGER NOT NULL,
+                round_id INTEGER NULL,
+                started_utc TEXT NULL,
+                settled_utc TEXT NULL,
+                state TEXT NOT NULL DEFAULT 'Incomplete',
+                cards_json TEXT NULL,
+                result_json TEXT NULL,
+                start_event_id INTEGER NULL,
+                result_event_id INTEGER NULL,
+                updated_utc TEXT NOT NULL,
+                is_complete INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (desk_id, shoe, round)
+            );
+            """);
+        ExecuteNonQuery(connection, """
+            CREATE TABLE IF NOT EXISTS bridge_delivery_attempts
+            (
+                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                attempted_utc TEXT NOT NULL,
+                succeeded INTEGER NOT NULL,
+                http_status INTEGER NULL,
+                retry_count INTEGER NOT NULL,
+                next_retry_utc TEXT NULL,
+                error TEXT NULL
+            );
+            """);
+        ExecuteNonQuery(connection, """
+            CREATE TABLE IF NOT EXISTS bridge_recovery_requests
+            (
+                command_id TEXT PRIMARY KEY,
+                command_type TEXT NOT NULL,
+                desk_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                shoe INTEGER NULL,
+                round INTEGER NULL,
+                round_id INTEGER NULL,
+                received_utc TEXT NOT NULL,
+                last_observed_utc TEXT NOT NULL,
+                result TEXT NOT NULL,
+                next_retry_utc TEXT NULL,
+                message TEXT NULL
+            );
+            """);
+        ExecuteNonQuery(connection, """
             CREATE INDEX IF NOT EXISTS ix_bridge_events_lookup
                 ON bridge_events (desk_id, shoe, round, type, event_id);
             """);
@@ -441,6 +881,98 @@ public sealed class BridgeEventJournal
             CREATE INDEX IF NOT EXISTS ix_bridge_events_outbox_endpoint_order
                 ON bridge_events (desk_id, device_id, status, event_id);
             """);
+        ExecuteNonQuery(connection, """
+            CREATE INDEX IF NOT EXISTS ix_bridge_rounds_query
+                ON bridge_rounds (desk_id, updated_utc DESC, shoe DESC, round DESC);
+            """);
+        ExecuteNonQuery(connection, """
+            CREATE INDEX IF NOT EXISTS ix_bridge_rounds_state
+                ON bridge_rounds (state, updated_utc DESC);
+            """);
+        ExecuteNonQuery(connection, """
+            CREATE INDEX IF NOT EXISTS ix_bridge_delivery_attempts_event
+                ON bridge_delivery_attempts (event_id, attempted_utc DESC, attempt_id DESC);
+            """);
+        ExecuteNonQuery(connection, """
+            CREATE INDEX IF NOT EXISTS ix_bridge_recovery_requests_query
+                ON bridge_recovery_requests (desk_id, last_observed_utc DESC, command_id);
+            """);
+        BackfillRoundProjections(connection);
+    }
+
+    private static void BackfillRoundProjections(SqliteConnection connection)
+    {
+        using (SqliteCommand count = connection.CreateCommand())
+        {
+            count.CommandText = "SELECT COUNT(*) FROM bridge_rounds;";
+            if (Convert.ToInt64(count.ExecuteScalar(), CultureInfo.InvariantCulture) > 0)
+            {
+                return;
+            }
+        }
+
+        List<BridgeBackfillEvent> events = [];
+        using (SqliteCommand query = connection.CreateCommand())
+        {
+            query.CommandText = """
+                SELECT event_id, occurred_utc, type, desk_id, device_id, shoe, round, round_id, payload_json
+                FROM bridge_events
+                WHERE type IN ('StartGame', 'CardDrawn', 'GameResult')
+                ORDER BY event_id;
+                """;
+            using SqliteDataReader reader = query.ExecuteReader();
+            while (reader.Read())
+            {
+                events.Add(new BridgeBackfillEvent(
+                    reader.GetInt64(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.GetString(4),
+                    reader.GetInt64(5),
+                    reader.GetInt64(6),
+                    reader.IsDBNull(7) ? null : reader.GetInt64(7),
+                    reader.GetString(8)));
+            }
+        }
+
+        if (events.Count == 0)
+        {
+            return;
+        }
+
+        using SqliteTransaction transaction = connection.BeginTransaction();
+        foreach (BridgeBackfillEvent stored in events)
+        {
+            try
+            {
+                using JsonDocument document = JsonDocument.Parse(stored.PayloadJson);
+                object? data = document.RootElement.TryGetProperty("data", out JsonElement dataElement)
+                    ? dataElement.Clone()
+                    : null;
+                Dictionary<string, object?> payload = new()
+                {
+                    ["type"] = stored.Type,
+                    ["timestamp"] = stored.OccurredUtc,
+                    ["sourceDataCode"] = stored.DeskId,
+                    ["deviceId"] = stored.DeviceId,
+                    ["shoe"] = stored.Shoe,
+                    ["round"] = stored.Round,
+                    ["roundId"] = stored.RoundId,
+                    ["data"] = data
+                };
+                string normalizedJson = JsonSerializer.Serialize(payload);
+                UpdateRoundProjectionAsync(connection, transaction, payload, normalizedJson, stored.EventId)
+                    .GetAwaiter()
+                    .GetResult();
+            }
+            catch (JsonException)
+            {
+                // Preserve invalid legacy payloads in bridge_events without fabricating projections.
+            }
+        }
+
+        transaction.Commit();
     }
 
     private static void ExecuteNonQuery(SqliteConnection connection, string commandText)
@@ -541,6 +1073,32 @@ public sealed class BridgeEventJournal
         return normalized.Length <= 500 ? normalized : normalized[..500];
     }
 
+    private static string RedactForStore(string text)
+    {
+        string normalized = TrimForStore(text);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return string.Empty;
+        }
+
+        normalized = Regex.Replace(
+            normalized,
+            @"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+            "$1[REDACTED]",
+            RegexOptions.CultureInvariant);
+        normalized = Regex.Replace(
+            normalized,
+            @"(?i)((?:signing[_ -]?key|jwt|token)\s*[:=]\s*)(?:""[^""]*""|'[^']*'|[^\s,;]+)",
+            "$1[REDACTED]",
+            RegexOptions.CultureInvariant);
+        normalized = Regex.Replace(
+            normalized,
+            @"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+            "[REDACTED]",
+            RegexOptions.CultureInvariant);
+        return normalized.Length <= 500 ? normalized : normalized[..500];
+    }
+
     private static int ToInt32(long value)
     {
         return value > int.MaxValue ? int.MaxValue : (int)value;
@@ -600,6 +1158,21 @@ public sealed record BridgeOutboxStatus(
     public static BridgeOutboxStatus Empty { get; } = new(0, 0, 0, null, null, string.Empty);
 }
 
+/// <summary>Audit record for one observed BMS recovery or resend command decision.</summary>
+public sealed record BridgeRecoveryAudit(
+    string CommandId,
+    string CommandType,
+    string SourceDataCode,
+    string DeviceId,
+    long? Shoe,
+    long? Round,
+    long? RoundId,
+    DateTimeOffset ReceivedUtc,
+    DateTimeOffset ObservedUtc,
+    string Result,
+    DateTimeOffset? NextRetryUtc,
+    string Message);
+
 /// <summary>
 /// Filter options for reading stored bridge event payloads.
 /// </summary>
@@ -629,3 +1202,22 @@ public sealed class BridgeEventQuery
     /// <summary>Maximum rows to return.</summary>
     public int Limit { get; init; } = 100;
 }
+
+internal sealed record BridgeRoundCardProjection(
+    string? Target,
+    int Index,
+    string? Suit,
+    string? Value,
+    long EventId,
+    string OccurredUtc);
+
+internal sealed record BridgeBackfillEvent(
+    long EventId,
+    string OccurredUtc,
+    string Type,
+    string DeskId,
+    string DeviceId,
+    long Shoe,
+    long Round,
+    long? RoundId,
+    string PayloadJson);

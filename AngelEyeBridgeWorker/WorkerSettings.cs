@@ -88,6 +88,21 @@ public sealed class WorkerSettings
 
     public void Validate()
     {
+        if (string.IsNullOrWhiteSpace(Bridge.InstanceName))
+        {
+            throw new InvalidOperationException("Bridge:InstanceName 不可為空。");
+        }
+
+        if (string.IsNullOrWhiteSpace(Bridge.EnvironmentName))
+        {
+            throw new InvalidOperationException("Bridge:Environment 不可為空。");
+        }
+
+        if (string.IsNullOrWhiteSpace(Bridge.Role))
+        {
+            throw new InvalidOperationException("Bridge:Role 不可為空。");
+        }
+
         if (string.IsNullOrWhiteSpace(Bms.EventApiUrl))
         {
             throw new InvalidOperationException("Bms:EventApiUrl 不可為空。");
@@ -172,6 +187,13 @@ public sealed class BmsWorkerSettings
 
 public sealed class BridgeWorkerSettings
 {
+    public string InstanceName { get; set; } = string.Empty;
+
+    [JsonPropertyName("environment")]
+    public string EnvironmentName { get; set; } = string.Empty;
+
+    public string Role { get; set; } = string.Empty;
+
     public string BridgeId { get; set; } = Environment.MachineName;
 
     public string BridgeName { get; set; } = "AngelEyeBridge";
@@ -202,6 +224,9 @@ public sealed class BridgeWorkerSettings
 
     public void Normalize(string configDirectory)
     {
+        InstanceName = InstanceName.Trim();
+        EnvironmentName = EnvironmentName.Trim();
+        Role = Role.Trim();
         BridgeId = string.IsNullOrWhiteSpace(BridgeId) ? Environment.MachineName : BridgeId.Trim();
         BridgeName = string.IsNullOrWhiteSpace(BridgeName) ? "AngelEyeBridge" : BridgeName.Trim();
         ConnectionMode = ShoeConnectionMode.Normalize(ConnectionMode);

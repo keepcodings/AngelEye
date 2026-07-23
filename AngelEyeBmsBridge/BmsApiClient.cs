@@ -179,13 +179,13 @@ public sealed class BmsApiClient : IDisposable
                 string eventLabel = BuildEventLabel(pending);
                 if (result.Success)
                 {
-                    await journal.MarkSentAsync(pending.EventId, now).ConfigureAwait(false);
+                    await journal.MarkSentAsync(pending.EventId, now, result.StatusCode).ConfigureAwait(false);
                     OnLogReceived?.Invoke($"POST {eventLabel} -> {result.StatusCode}，已標記送達。");
                 }
                 else
                 {
                     int retryCount = pending.RetryCount + 1;
-                    await journal.MarkFailedAsync(pending.EventId, retryCount, now, result.Error).ConfigureAwait(false);
+                    await journal.MarkFailedAsync(pending.EventId, retryCount, now, result.Error, result.StatusCode).ConfigureAwait(false);
                     OnLogReceived?.Invoke($"POST {eventLabel} 失敗: {result.Error}，稍後重試 #{retryCount}。");
                 }
             }

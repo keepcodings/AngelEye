@@ -1469,7 +1469,7 @@ public partial class Form1 : Form
 
     private bool CanSendShoeCommand(ShoeEndpoint endpoint, string action)
     {
-        if (endpoint.MockMode || _settings.AllowPhysicalShoeCommands)
+        if (EngineeringCommandPolicy.CanSend(endpoint.MockMode, _settings.AllowPhysicalShoeCommands))
         {
             return true;
         }

@@ -23,6 +23,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private readonly HashSet<string> _handledBmsCommandIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ShoeEndpoint, CancellationTokenSource> _pendingNextRoundCountdowns = [];
     private readonly RecoverRoundBackoffTracker _recoverRoundBackoff = new();
+    private readonly WorkerHttpRouter _httpRouter;
     private readonly object _roundGate = new();
     private readonly object _commandGate = new();
     private long _eventSequence;
@@ -46,6 +47,16 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             RegisterEndpoint(endpoint);
         }
+
+        _httpRouter = new WorkerHttpRouter(
+            new WorkerQuerySource(
+                settings.Bridge.InstanceName,
+                settings.Bridge.EnvironmentName,
+                settings.Bridge.Role),
+            BuildHealthResponse,
+            BuildQueryStatusSnapshot,
+            _journal,
+            message => Log("ERR", message));
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -610,23 +621,32 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private async Task<BridgeCommandHandlingResult> HandleBmsCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        DateTimeOffset observedAt = DateTimeOffset.UtcNow;
+        bool alreadyHandled;
         lock (_commandGate)
         {
-            if (!string.IsNullOrWhiteSpace(command.CommandId) && _handledBmsCommandIds.Contains(command.CommandId))
-            {
-                return BridgeCommandHandlingResult.Handled("Command was already handled in this bridge session.");
-            }
+            alreadyHandled = !string.IsNullOrWhiteSpace(command.CommandId) && _handledBmsCommandIds.Contains(command.CommandId);
         }
 
-        string type = command.Type.Trim();
-        BridgeCommandHandlingResult result = type switch
+        BridgeCommandHandlingResult result;
+        if (alreadyHandled)
         {
-            "RecoverRound" => await HandleRecoverRoundCommandAsync(command, cancellationToken).ConfigureAwait(false),
-            "ResendEvent" => await HandleResendEventCommandAsync(command, cancellationToken).ConfigureAwait(false),
-            _ => BridgeCommandHandlingResult.Rejected($"Unsupported command type: {command.Type}")
-        };
+            result = BridgeCommandHandlingResult.Handled("Command was already handled in this bridge session.");
+        }
+        else
+        {
+            string type = command.Type.Trim();
+            result = type switch
+            {
+                "RecoverRound" => await HandleRecoverRoundCommandAsync(command, cancellationToken).ConfigureAwait(false),
+                "ResendEvent" => await HandleResendEventCommandAsync(command, cancellationToken).ConfigureAwait(false),
+                _ => BridgeCommandHandlingResult.Rejected($"Unsupported command type: {command.Type}")
+            };
+        }
 
-        if (result.Success && !string.IsNullOrWhiteSpace(command.CommandId))
+        await RecordCommandAuditAsync(command, result, observedAt).ConfigureAwait(false);
+
+        if (!alreadyHandled && result.Success && !string.IsNullOrWhiteSpace(command.CommandId))
         {
             lock (_commandGate)
             {
@@ -635,6 +655,46 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
 
         return result;
+    }
+
+    private async Task RecordCommandAuditAsync(
+        AngelBridgeCommand command,
+        BridgeCommandHandlingResult result,
+        DateTimeOffset observedAt)
+    {
+        string auditResult = result.Status switch
+        {
+            "Deferred" => "Backoff",
+            "Handled" when result.Message.StartsWith("Requeued", StringComparison.OrdinalIgnoreCase) => "Requeued",
+            _ => result.Status
+        };
+        DateTimeOffset? nextRetryUtc = null;
+        if (string.Equals(command.Type, "RecoverRound", StringComparison.Ordinal) &&
+            auditResult is "Backoff" or "NotFound")
+        {
+            RecoverRoundBackoffDecision decision = _recoverRoundBackoff.GetDecision(command, observedAt);
+            if (!decision.ShouldAttempt)
+            {
+                nextRetryUtc = observedAt.Add(decision.Delay);
+            }
+        }
+
+        string commandId = string.IsNullOrWhiteSpace(command.CommandId)
+            ? $"local-{Guid.NewGuid():N}"
+            : command.CommandId;
+        await _journal.RecordRecoveryRequestAsync(new BridgeRecoveryAudit(
+            commandId,
+            command.Type.Trim(),
+            command.SourceDataCode,
+            command.DeviceId,
+            command.Shoe,
+            command.Round,
+            command.RoundId,
+            observedAt,
+            DateTimeOffset.UtcNow,
+            auditResult,
+            nextRetryUtc,
+            result.Message)).ConfigureAwait(false);
     }
 
     private async Task<BridgeCommandHandlingResult> HandleRecoverRoundCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
@@ -805,15 +865,30 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         await using NetworkStream stream = client.GetStream();
         using StreamReader reader = new(stream, Encoding.ASCII, leaveOpen: true);
         string? requestLine = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
-        string path = requestLine?.Split(' ', StringSplitOptions.RemoveEmptyEntries).ElementAtOrDefault(1) ?? "/health";
+        string[] requestParts = requestLine?.Split(' ', StringSplitOptions.RemoveEmptyEntries) ?? [];
+        string method = requestParts.ElementAtOrDefault(0) ?? "GET";
+        string target = requestParts.ElementAtOrDefault(1) ?? "/health";
 
         while (!string.IsNullOrWhiteSpace(await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false)))
         {
         }
 
-        (int status, string body) = BuildHealthResponse(path);
-        byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
-        string header = $"HTTP/1.1 {status} {(status == 200 ? "OK" : "Service Unavailable")}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {bodyBytes.Length}\r\nConnection: close\r\n\r\n";
+        WorkerHttpResponse response;
+        try
+        {
+            response = await _httpRouter.RouteAsync(method, target, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log("ERR", $"Query request failed: {ex.Message}");
+            response = new WorkerHttpResponse(
+                500,
+                "Internal Server Error",
+                "{\"error\":{\"code\":\"internal_error\",\"message\":\"The query could not be completed.\"}}");
+        }
+
+        byte[] bodyBytes = Encoding.UTF8.GetBytes(response.Body);
+        string header = $"HTTP/1.1 {response.Status} {response.ReasonPhrase}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {bodyBytes.Length}\r\nConnection: close\r\n\r\n";
         byte[] headerBytes = Encoding.ASCII.GetBytes(header);
         await stream.WriteAsync(headerBytes, cancellationToken).ConfigureAwait(false);
         await stream.WriteAsync(bodyBytes, cancellationToken).ConfigureAwait(false);
@@ -867,6 +942,39 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         };
 
         return (allEnabledConnected ? 200 : 503, JsonSerializer.Serialize(payload, WorkerSettings.JsonOptions));
+    }
+
+    private WorkerStatusData BuildQueryStatusSnapshot()
+    {
+        List<WorkerEndpointStatusData> endpoints = _endpoints.Select(endpoint =>
+        {
+            BridgeOutboxStatus outbox = GetEndpointOutboxStatus(endpoint);
+            DateTimeOffset? lastEventUtc = endpoint.LastEventAt.HasValue
+                ? new DateTimeOffset(endpoint.LastEventAt.Value).ToUniversalTime()
+                : null;
+            return new WorkerEndpointStatusData(
+                endpoint.DeskName,
+                endpoint.SourceDataCode,
+                endpoint.DeviceId,
+                endpoint.Enabled,
+                endpoint.IsConnected,
+                endpoint.StatusText,
+                lastEventUtc,
+                endpoint.LastEventText,
+                endpoint.CurrentShoe,
+                endpoint.CurrentRound,
+                endpoint.CurrentRoundId,
+                endpoint.BmsTransmitEnabled,
+                outbox.PendingCount,
+                outbox.FailedCount);
+        }).ToList();
+
+        return new WorkerStatusData(
+            _settings.Bridge.BridgeId,
+            _settings.Bridge.BridgeName,
+            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0",
+            _bmsApiClient.IsRunning,
+            endpoints);
     }
 
     private void LogHealthSummary()

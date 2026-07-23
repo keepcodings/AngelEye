@@ -13,6 +13,7 @@
     <Compile Include="..\AngelEyeBmsBridge\AngelEyeProtocol.cs" Link="Shared\AngelEyeProtocol.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BmsApiClient.cs" Link="Shared\BmsApiClient.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeEventJournal.cs" Link="Shared\BridgeEventJournal.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\BridgeJournalQueries.cs" Link="Shared\BridgeJournalQueries.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeGameNumbering.cs" Link="Shared\BridgeGameNumbering.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeSettings.cs" Link="Shared\BridgeSettings.cs" />
     <Compile Include="..\AngelEyeBmsBridge\JwtTokenGenerator.cs" Link="Shared\JwtTokenGenerator.cs" />
@@ -23,7 +24,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.1" />
-    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.11" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.4" />
     <PackageReference Include="System.IO.Ports" Version="10.0.8" />
   </ItemGroup>
 

@@ -7,6 +7,8 @@
 
 三台 TeleBet VM 使用同一套程式，各自放對應角色的設定檔；服務名稱都使用 `angel-eye-bridge.service`。
 
+Windows `AngelEyeBmsBridge.exe` 無參數時是唯讀 Query Console；只有明確加上 `--engineering` 才進入原工程介面。Query Console 不直接連 MOXA、不開啟 Worker journal，也不送 BMS POST。
+
 ## 目錄
 
 ```bash
@@ -70,6 +72,47 @@ QA  -> 10.5.32.124:4001, NPort 5110, 9600 8N1 None
 
 同一張桌同一時間只能有一個 Bridge 服務連線，避免 BMS 收到重複牌訊。
 
+## Query Console migration 上線順序
+
+每台 VM 上線前都要保存「程式、設定、SQLite、靴局狀態」四項備份。以下命令中的時間戳應改成實際變更單號或時間；資料庫複製前先停止服務，確保備份是一致快照。
+
+```bash
+sudo systemctl stop angel-eye-bridge
+sudo mkdir -p /var/backups/angel-eye-bridge/20260723-query-console
+sudo cp -a /opt/angel-eye-bridge /var/backups/angel-eye-bridge/20260723-query-console/opt
+sudo cp -a /etc/angel-eye-bridge /var/backups/angel-eye-bridge/20260723-query-console/etc
+sudo cp -a /var/lib/angel-eye-bridge/bridge-events.sqlite /var/backups/angel-eye-bridge/20260723-query-console/bridge-events.sqlite
+sudo cp -a /var/lib/angel-eye-bridge/bridge-state.json /var/backups/angel-eye-bridge/20260723-query-console/bridge-state.json
+```
+
+若狀態檔尚不存在，可略過該檔但必須在變更紀錄註明。不要只備份 SQLite 的 WAL 檔；停服務後備份主資料庫檔。
+
+上線順序：
+
+1. **QA `.29`**：套用 `appsettings.server-29.qa.example.json` 對應設定，執行 `--check-config`，啟動後驗證 `/health`、`/api/v1/status`、牌局查詢、缺結果、retry 與 RecoverRound。Query Console 使用 `QA .29` profile。
+2. **正式主用 `.30`**：確認 `.31` 為 `disabled/inactive`，備份 `.30` 後更新程式與設定，執行 `--check-config`，再啟動並驗證三桌與 outbox。Query Console 使用 `正式主用 .30` profile。
+3. **正式備援 `.31`**：只更新程式與設定並執行 `--check-config`；最後必須再次執行 `sudo systemctl disable --now angel-eye-bridge`。`.31` 的 Query Console profile 只有在 standby Worker 已因正式切換而啟動時才會有即時資料，建立 SSH tunnel 本身不得啟動 sender。
+
+每一步都必須核對 `/api/v1/status` 的 `instanceName`、`environment`、`role`，避免把 `.29/.30/.31` 資料來源看錯。HTTP 傳送成功只代表 `BMS endpoint accepted`，不代表 BMS 後續流程已最終入庫。
+
+## Rollback
+
+回復前先停止目標 VM 的 service。舊版 Worker 會忽略新增的 projection/audit tables，因此一般優先回復舊程式與舊設定、保留目前 SQLite，以免遺失上線後收到的事件；只有確認 schema／資料檔本身造成故障、且已匯出變更期間事件時，才用備份 SQLite 覆蓋。
+
+```bash
+sudo systemctl stop angel-eye-bridge
+sudo cp -a /var/backups/angel-eye-bridge/20260723-query-console/opt/. /opt/angel-eye-bridge/
+sudo cp -a /var/backups/angel-eye-bridge/20260723-query-console/etc/. /etc/angel-eye-bridge/
+# 僅在變更負責人確認可接受遺失上線後事件時才執行下一行：
+# sudo cp -a /var/backups/angel-eye-bridge/20260723-query-console/bridge-events.sqlite /var/lib/angel-eye-bridge/bridge-events.sqlite
+/opt/angel-eye-bridge/angel-eye-bridge --config /etc/angel-eye-bridge/appsettings.json --check-config
+```
+
+- 回復 `.29` 或 `.30`：config check 通過後才 `sudo systemctl start angel-eye-bridge`，再驗證 `/health` 與 outbox。
+- 回復 `.31`：完成後仍執行 `sudo systemctl disable --now angel-eye-bridge`；除非走正式主備切換程序，不得啟動。
+- 正式主備切換：先在 `.30` 執行 `disable --now` 並確認 inactive，之後才能在 `.31` 執行 `enable --now`。切回同理，任何時刻 `.30/.31` 不得同時送資料。
+- Windows GUI 回復：換回舊版 exe 即可；GUI 沒有 database migration，也不得用 GUI 觸發補送或主備切換。
+
 ## 設定重點
 
 `bridge.connectionMode` 是整台 Bridge 共用設定：
@@ -124,6 +167,21 @@ journalctl -u angel-eye-bridge --since today --no-pager
 ```bash
 curl http://127.0.0.1:18080/health
 ```
+
+查詢 API 與 health 共用 loopback listener，預設不直接開放到網路。從 Windows 查詢台連入 `.29`、`.30` 或 `.31` 時，先建立 SSH tunnel：
+
+```powershell
+# QA .29
+ssh -p 53229 -N -L 18080:127.0.0.1:18080 telbet@10.5.32.29
+
+# 正式主用 .30（本機改用 18081，避免與 QA profile 衝突）
+ssh -p 53229 -N -L 18081:127.0.0.1:18080 telbet@10.5.32.30
+
+# 正式備援 .31（只查詢；不得因此啟動 standby Worker sender）
+ssh -p 53229 -N -L 18082:127.0.0.1:18080 telbet@10.5.32.31
+```
+
+Query Console profile 對應 `http://127.0.0.1:18080`、`:18081`、`:18082`。未完成 TLS 與身分驗證前，不可把 `health.host` 改成 `0.0.0.0` 或一般網卡位址。
 
 HTTP 200 代表所有啟用的端點都已連線。  
 HTTP 503 代表至少一張啟用桌未連線；回傳 JSON 會列出每張桌的連線、靴局、最後事件與 outbox 待送數。
