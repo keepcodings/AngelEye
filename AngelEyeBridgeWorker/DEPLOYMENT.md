@@ -7,29 +7,210 @@
 
 三台 TeleBet VM 使用同一套程式，各自放對應角色的設定檔；服務名稱都使用 `angel-eye-bridge.service`。
 
-Windows `AngelEyeBmsBridge.exe` 無參數時是唯讀 Query Console；只有明確加上 `--engineering` 才進入原工程介面。Query Console 的 Worker 查詢頁不開啟 Worker journal，也不送 BMS POST；「MOXA 即時監看」只有操作員明確按開始後才建立額外的 receive-only 連線。
+Windows `AngelEyeBmsBridge.exe` 無參數時是唯讀 Query Console；`--engineering` 進入原牌盒工程介面；只有 `--deployment` 會開啟獨立 Worker 部署介面。Query Console 與 MOXA monitor 沒有部署按鈕，也不會建立部署 SSH 連線。
 
 ## 目錄
 
 ```bash
-/opt/angel-eye-bridge/                 # 程式
+/opt/angel-eye-bridge/releases/        # immutable 版本目錄
+/opt/angel-eye-bridge/current          # systemd 使用的目前版本 symlink
+/opt/angel-eye-bridge/previous         # 上一版本 symlink
 /etc/angel-eye-bridge/appsettings.json # 設定
 /var/lib/angel-eye-bridge/             # SQLite outbox
 /var/lib/angel-eye-bridge/bridge-state.json # 靴局狀態
+/var/backups/angel-eye-bridge/          # 每個 deployment ID 的一致性備份
+/var/log/angel-eye-bridge/deployments/ # root deployment JSONL audit
 ```
 
 ## 安裝
 
 ```bash
 sudo useradd --system --home /var/lib/angel-eye-bridge --shell /usr/sbin/nologin angelbridge
-sudo mkdir -p /opt/angel-eye-bridge /etc/angel-eye-bridge /var/lib/angel-eye-bridge
+sudo mkdir -p /opt/angel-eye-bridge/releases/bootstrap /etc/angel-eye-bridge /var/lib/angel-eye-bridge
 sudo chown -R angelbridge:angelbridge /var/lib/angel-eye-bridge
-sudo cp -r publish/* /opt/angel-eye-bridge/
+sudo cp -r publish/* /opt/angel-eye-bridge/releases/bootstrap/
+sudo ln -sfn /opt/angel-eye-bridge/releases/bootstrap /opt/angel-eye-bridge/current
 sudo cp appsettings.server-29.qa.example.json /etc/angel-eye-bridge/appsettings.json
 sudo cp systemd/angel-eye-bridge.service /etc/systemd/system/angel-eye-bridge.service
 sudo systemctl daemon-reload
 sudo systemctl enable angel-eye-bridge
 ```
+
+## 工程部署模式的首次佈建
+
+這一節由 Linux 管理員在 `.29`、`.30`、`.31` 各做一次。GUI 不取得任意 shell；它只能用 `angeldeploy` 帳號呼叫固定的 root-owned script。
+
+```bash
+sudo useradd --system --create-home --shell /usr/sbin/nologin angeldeploy
+sudo install -d -o angeldeploy -g angeldeploy -m 0700 /home/angeldeploy/.ssh
+sudo install -o angeldeploy -g angeldeploy -m 0600 engineer-deploy.pub /home/angeldeploy/.ssh/authorized_keys
+
+sudo install -o root -g root -m 0755 systemd/angel-eye-worker-deploy /usr/local/sbin/angel-eye-worker-deploy
+sudo install -o root -g root -m 0440 systemd/angel-eye-worker-deploy.sudoers /etc/sudoers.d/angel-eye-worker-deploy
+sudo visudo -cf /etc/sudoers.d/angel-eye-worker-deploy
+
+sudo install -d -o root -g root -m 0755 /etc/angel-eye-deploy
+sudo install -o root -g root -m 0644 release-signing.cer /etc/angel-eye-deploy/release-signing.pem
+sudo install -d -o root -g root -m 0750 /var/log/angel-eye-bridge/deployments
+sudo install -d -o root -g root -m 0750 /var/tmp/angel-eye-deploy
+```
+
+私鑰只放在工程工作站受 ACL 保護的位置，不進 Git、不放進 target JSON。Linux trust path 只放公開簽章憑證，不放簽章私鑰。
+
+### systemd current symlink 遷移
+
+新的 unit 固定從 `/opt/angel-eye-bridge/current/angel-eye-bridge` 啟動。第一次套用前先停服務並把現有可執行內容搬入版本目錄；`/etc` 與 `/var/lib` 不可移動。
+
+```bash
+sudo systemctl stop angel-eye-bridge
+sudo mkdir -p /opt/angel-eye-bridge/releases/initial
+# 將既有 flat publish 的所有一般檔案複製進 releases/initial；不要搬 /etc 或 /var/lib。
+sudo find /opt/angel-eye-bridge -maxdepth 1 -type f \
+  -exec cp -a -t /opt/angel-eye-bridge/releases/initial/ {} +
+sudo ln -sfn /opt/angel-eye-bridge/releases/initial /opt/angel-eye-bridge/current
+sudo install -o root -g root -m 0644 systemd/angel-eye-bridge.service /etc/systemd/system/angel-eye-bridge.service
+sudo systemctl daemon-reload
+sudo systemctl start angel-eye-bridge
+curl --fail http://127.0.0.1:18080/health
+```
+
+`.31` 不執行最後兩個 start/health 動作，改為：
+
+```bash
+sudo systemctl disable --now angel-eye-bridge
+```
+
+### SSH host fingerprint
+
+在隔離管道向 Linux 管理員取得每台 VM 的 SSH host public key fingerprint，再與工程工作站掃描結果逐字核對。不可只信任第一次網路掃描的值。
+
+```powershell
+ssh-keyscan -p 22 10.5.32.29 | ssh-keygen -lf - -E sha256
+ssh-keyscan -p 22 10.5.32.30 | ssh-keygen -lf - -E sha256
+ssh-keyscan -p 22 10.5.32.31 | ssh-keygen -lf - -E sha256
+```
+
+核對後在 `%ProgramData%\AngelEye\deployment-targets.json` 只寫三個 fingerprint。Host、port、environment、role、service 都由程式 allow-list 固定，設定檔不能改：
+
+```json
+{
+  "fingerprints": {
+    "qa-29": "SHA256:REPLACE_WITH_VERIFIED_29_FINGERPRINT",
+    "production-30": "SHA256:REPLACE_WITH_VERIFIED_30_FINGERPRINT",
+    "standby-31": "SHA256:REPLACE_WITH_VERIFIED_31_FINGERPRINT"
+  }
+}
+```
+
+缺少、格式錯誤或 mismatch 都會在 authentication 與 upload 前 fail closed。
+
+## Signed release
+
+部署目錄必須包含三個相互對應的檔案：
+
+```text
+release.tar.gz
+release-manifest.json
+release-manifest.p7s
+```
+
+先產生 Worker `linux-x64` release：
+
+```powershell
+dotnet publish AngelEyeBridgeWorker/AngelEyeBridgeWorker.csproj -c Release -r linux-x64 --self-contained true -o artifacts/worker-linux-x64
+```
+
+`release.tar.gz` 的 root 必須直接包含 `angel-eye-bridge`。Manifest schema 固定為：
+
+```json
+{
+  "schemaVersion": 1,
+  "version": "1.4.0",
+  "buildCommit": "a14aed3",
+  "targetRuntime": "linux-x64",
+  "artifactFile": "release.tar.gz",
+  "artifactSha256": "<release.tar.gz 的 64 字元 lowercase SHA-256>",
+  "createdUtc": "2026-07-23T06:00:00Z"
+}
+```
+
+用受控的 release signing private key 對 manifest 原始 bytes 產生 detached DER CMS signature。簽章私鑰應在 CI secret store 或離線簽章機，不在工程工作站一般目錄：
+
+```bash
+openssl cms -sign -binary \
+  -in release-manifest.json \
+  -signer release-signing.cer \
+  -inkey release-signing.key \
+  -outform DER \
+  -out release-manifest.p7s \
+  -nosmimecap
+```
+
+GUI 會用工程人員選取的 pinned signing certificate 驗證；Linux script 會再用 `/etc/angel-eye-deploy/release-signing.pem` 驗一次 signature、runtime、filename 與 digest。任何不符都發生在 stop service 或切換 current symlink 之前。
+
+## GUI 更新流程
+
+啟動工程部署模式：
+
+```powershell
+.\AngelEyeBmsBridge.exe --deployment
+```
+
+操作順序：
+
+1. 選擇固定 target，填入 SSH 使用者 `angeldeploy` 及私鑰，按「查詢狀態」。GUI 必須核對 instance、environment、role 與 service policy。
+2. 選擇含三個 signed release 檔案的目錄及 pinned signing certificate，按「驗證套件」。畫面會顯示 version、commit 與完整 digest。
+3. 在 `.29` 按「上傳並 Preflight」。成功後會顯示新的 deployment UUID；這時還沒送 install。
+4. 按「確認部署」，在確認對話框再次核對 target、version、digest 與 UUID。送出後不得為同一 UUID 重按 install。
+5. 驗證 `.29` health、Worker status、outbox 與實際 TeleBet 查詢資料。只有 remote `health/succeeded` 的相同 digest 會形成 Production gate。
+6. 更新 `.30` 時，GUI 會先連 `.31` 並證明它是正確 Standby 且 `disabled/inactive`；無 QA gate 或 peer 狀態未知都不能 override。
+7. 更新 `.31` 時仍要求相同 QA digest；安裝後 script 與 GUI 都會再次確認 `.31` 為 `disabled/inactive`。第一版不提供主備切換。
+
+GUI 本機 audit 位於：
+
+```text
+%LocalAppData%\AngelEye\deployment-audit\worker-deployments.jsonl
+```
+
+遠端 audit 位於：
+
+```text
+/var/log/angel-eye-bridge/deployments/<deployment-id>.jsonl
+```
+
+若 GUI 在 install 後斷線，使用同一個 target 與畫面保留的 deployment UUID 按「恢復操作狀態」。GUI 只執行 `status` 並讀取本機 audit，不會重送 install。
+
+## 部署 Rollback 與人工復原
+
+GUI 的「人工 Rollback」只接受本機 audit 已存在的 deployment UUID，並再次要求載入原 release 以核對 digest。Linux script 會依 `/var/backups/angel-eye-bridge/<deployment-id>/` 記錄的 previous current link 與原 service policy 回復。
+
+新版本 restart 或 bounded health check 失敗時，script 只自動 rollback 一次：
+
+- exit `70`：新版本失敗，但 previous release 已恢復且健康。
+- exit `71`：自動或人工 rollback 也失敗；停止所有自動動作。
+- 其他非零：verify、config、identity 或操作前置條件失敗。
+
+exit `71` 時，不要重跑 install。先看遠端 JSONL 的 `manualRecoveryPath`，在 console 由 Linux 管理員核對：
+
+```bash
+sudo cat /var/log/angel-eye-bridge/deployments/<deployment-id>.jsonl
+sudo cat /var/backups/angel-eye-bridge/<deployment-id>/previous-current
+sudo cat /var/backups/angel-eye-bridge/<deployment-id>/service-active
+sudo cat /var/backups/angel-eye-bridge/<deployment-id>/service-enabled
+sudo systemctl status angel-eye-bridge
+```
+
+確認 previous release 目錄仍完整後才手動重建 `/opt/angel-eye-bridge/current` symlink，再依備份的 service policy 啟停。不要用 artifact 覆蓋 `/etc/angel-eye-bridge`、`/var/lib/angel-eye-bridge` 或 SQLite。
+
+## 部署功能驗證
+
+Windows 與 Docker 可用時，在 repository root 執行：
+
+```powershell
+.\scripts\test-worker-deployment.ps1
+```
+
+此命令會跑 deployment domain/GUI/fake SSH tests，再在 Linux container 驗證 signature/digest fail-before-mutation、原子安裝、設定與狀態 hash 不變、health rollback 及 Standby disabled/inactive。
 
 修改 `/etc/angel-eye-bridge/appsettings.json` 後先檢查：
 

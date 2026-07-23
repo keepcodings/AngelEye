@@ -10,6 +10,11 @@ public sealed class QueryConsoleClientTests
     [Fact]
     public void ModeSelector_DefaultsToQuery_AndRequiresExplicitEngineeringFlag()
     {
+        Assert.Equal(ApplicationMode.Query, ApplicationModeSelector.Select([]));
+        Assert.Equal(ApplicationMode.Query, ApplicationModeSelector.Select(["--query"]));
+        Assert.Equal(ApplicationMode.Engineering, ApplicationModeSelector.Select(["--engineering"]));
+        Assert.Equal(ApplicationMode.Deployment, ApplicationModeSelector.Select(["--deployment"]));
+        Assert.Equal(ApplicationMode.Deployment, ApplicationModeSelector.Select(["--DEPLOYMENT"]));
         Assert.False(ApplicationModeSelector.IsEngineering([]));
         Assert.False(ApplicationModeSelector.IsEngineering(["--query"]));
         Assert.True(ApplicationModeSelector.IsEngineering(["--engineering"]));

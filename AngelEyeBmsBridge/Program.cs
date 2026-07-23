@@ -11,6 +11,12 @@ static class Program
         // To customize application configuration such as set high DPI settings or default font,
         // see https://aka.ms/applicationconfiguration.
         ApplicationConfiguration.Initialize();
-        Application.Run(ApplicationModeSelector.IsEngineering(args) ? new Form1() : new QueryConsoleForm());
+        Form form = ApplicationModeSelector.Select(args) switch
+        {
+            ApplicationMode.Engineering => new Form1(),
+            ApplicationMode.Deployment => new WorkerDeploymentForm(),
+            _ => new QueryConsoleForm()
+        };
+        Application.Run(form);
     }    
 }

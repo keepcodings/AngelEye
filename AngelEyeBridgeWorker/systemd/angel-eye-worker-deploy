@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+SERVICE_NAME="angel-eye-bridge"
+SCRIPT_VERSION="1"
+
+if [[ "${ANGEL_DEPLOY_TEST_MODE:-0}" == "1" ]]; then
+  TEST_ROOT="${ANGEL_DEPLOY_TEST_ROOT:?ANGEL_DEPLOY_TEST_ROOT is required in test mode}"
+  [[ "$TEST_ROOT" == /tmp/angel-deploy-test-* &&
+     -f "${TEST_ROOT}/.angel-deploy-test-root" ]] || {
+    echo "invalid deployment test root" >&2
+    exit 77
+  }
+  OPT_ROOT="${TEST_ROOT}/opt/angel-eye-bridge"
+  ETC_ROOT="${TEST_ROOT}/etc/angel-eye-bridge"
+  VAR_ROOT="${TEST_ROOT}/var/lib/angel-eye-bridge"
+  BACKUP_ROOT="${TEST_ROOT}/var/backups/angel-eye-bridge"
+  STAGING_ROOT="${TEST_ROOT}/var/tmp/angel-eye-deploy"
+  AUDIT_ROOT="${TEST_ROOT}/var/log/angel-eye-bridge/deployments"
+  TRUST_CERT="${TEST_ROOT}/etc/angel-eye-deploy/release-signing.pem"
+else
+  if [[ "${EUID:-1}" != "0" ]]; then
+    echo "angel-eye-worker-deploy must run as root" >&2
+    exit 77
+  fi
+  OPT_ROOT="/opt/angel-eye-bridge"
+  ETC_ROOT="/etc/angel-eye-bridge"
+  VAR_ROOT="/var/lib/angel-eye-bridge"
+  BACKUP_ROOT="/var/backups/angel-eye-bridge"
+  STAGING_ROOT="/var/tmp/angel-eye-deploy"
+  AUDIT_ROOT="/var/log/angel-eye-bridge/deployments"
+  TRUST_CERT="/etc/angel-eye-deploy/release-signing.pem"
+fi
+
+CONFIG_PATH="${ETC_ROOT}/appsettings.json"
+CURRENT_LINK="${OPT_ROOT}/current"
+PREVIOUS_LINK="${OPT_ROOT}/previous"
+RELEASES_ROOT="${OPT_ROOT}/releases"
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "required command not found: $1" >&2
+    exit 69
+  }
+}
+
+json_emit() {
+  local deployment_id="$1"
+  local stage="$2"
+  local status="$3"
+  local message="$4"
+  local previous_version="${5:-}"
+  local target_version="${6:-}"
+  local rollback_performed="${7:-false}"
+  local recovery_path="${8:-}"
+  local timestamp target operator artifact_digest
+  timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  target=""
+  if [[ -f "$CONFIG_PATH" ]]; then
+    target="$(python3 - "$CONFIG_PATH" <<'PY' 2>/dev/null || true
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    print(json.load(stream).get("bridge", {}).get("instanceName", ""))
+PY
+)"
+  fi
+  operator="${SUDO_USER:-${USER:-unknown}}"
+  artifact_digest=""
+  if [[ -n "$deployment_id" &&
+        -f "${STAGING_ROOT}/${deployment_id}/release-manifest.json" ]]; then
+    artifact_digest="$(python3 - "${STAGING_ROOT}/${deployment_id}/release-manifest.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    print(json.load(stream).get("artifactSha256", ""))
+PY
+)"
+  elif [[ -n "$deployment_id" &&
+          -f "${BACKUP_ROOT}/${deployment_id}/release-manifest.json" ]]; then
+    artifact_digest="$(python3 - "${BACKUP_ROOT}/${deployment_id}/release-manifest.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    print(json.load(stream).get("artifactSha256", ""))
+PY
+)"
+  fi
+  local line
+  line="$(python3 - "$deployment_id" "$stage" "$status" "$message" \
+    "$timestamp" "$previous_version" "$target_version" \
+    "$rollback_performed" "$recovery_path" "$target" "$operator" \
+    "$artifact_digest" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "deploymentId": sys.argv[1] or None,
+    "target": sys.argv[10] or None,
+    "operator": sys.argv[11],
+    "artifactSha256": sys.argv[12] or None,
+    "stage": sys.argv[2],
+    "status": sys.argv[3],
+    "message": sys.argv[4],
+    "timestampUtc": sys.argv[5],
+    "previousVersion": sys.argv[6] or None,
+    "targetVersion": sys.argv[7] or None,
+    "rollbackPerformed": sys.argv[8].lower() == "true",
+    "manualRecoveryPath": sys.argv[9] or None
+}, separators=(",", ":")))
+PY
+)"
+  echo "$line"
+  if [[ -n "$deployment_id" ]]; then
+    mkdir -p "$AUDIT_ROOT"
+    printf '%s\n' "$line" >> "${AUDIT_ROOT}/${deployment_id}.jsonl"
+  fi
+}
+
+validate_deployment_id() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || {
+    echo "invalid deployment id" >&2
+    exit 64
+  }
+}
+
+read_identity() {
+  python3 - "$CONFIG_PATH" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    bridge = json.load(stream)["bridge"]
+print(bridge.get("instanceName", ""))
+print(bridge.get("environment", ""))
+print(bridge.get("role", ""))
+PY
+}
+
+read_health_port() {
+  python3 - "$CONFIG_PATH" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    value = json.load(stream).get("health", {}).get("port", 18080)
+print(int(value))
+PY
+}
+
+read_manifest_field() {
+  local manifest="$1"
+  local field="$2"
+  python3 - "$manifest" "$field" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    value = json.load(stream)[sys.argv[2]]
+print(value)
+PY
+}
+
+release_version() {
+  local link="$1"
+  if [[ -L "$link" && -f "$(readlink -f "$link")/.release-manifest.json" ]]; then
+    read_manifest_field "$(readlink -f "$link")/.release-manifest.json" "version"
+  else
+    printf ''
+  fi
+}
+
+service_is_active() {
+  systemctl is-active --quiet "$SERVICE_NAME"
+}
+
+service_is_enabled() {
+  systemctl is-enabled --quiet "$SERVICE_NAME"
+}
+
+health_is_ok() {
+  local port
+  port="$(read_health_port)"
+  curl --fail --silent --show-error \
+    --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null
+}
+
+wait_for_health() {
+  local attempts="${ANGEL_DEPLOY_HEALTH_ATTEMPTS:-10}"
+  local delay="${ANGEL_DEPLOY_HEALTH_DELAY_SECONDS:-2}"
+  local index
+  for ((index=1; index<=attempts; index++)); do
+    if health_is_ok; then
+      return 0
+    fi
+    sleep "$delay"
+  done
+  return 1
+}
+
+status_action() {
+  require_command python3
+  [[ -f "$CONFIG_PATH" ]] || {
+    echo "Worker config not found: $CONFIG_PATH" >&2
+    exit 66
+  }
+  mapfile -t identity < <(read_identity)
+  local active=false enabled=false healthy=false
+  service_is_active && active=true
+  service_is_enabled && enabled=true
+  health_is_ok && healthy=true
+  local current_version previous_version last_deployment
+  local last_stage="idle" last_result="" last_artifact_digest=""
+  current_version="$(release_version "$CURRENT_LINK")"
+  previous_version="$(release_version "$PREVIOUS_LINK")"
+  last_deployment="$(find "$AUDIT_ROOT" -maxdepth 1 -type f -name '*.jsonl' \
+    -printf '%T@ %f\n' 2>/dev/null | sort -nr | head -n1 | awk '{print $2}' | sed 's/\.jsonl$//' || true)"
+  if [[ -n "$last_deployment" &&
+        -f "${AUDIT_ROOT}/${last_deployment}.jsonl" ]]; then
+    mapfile -t last_event < <(
+      tail -n 1 "${AUDIT_ROOT}/${last_deployment}.jsonl" |
+        python3 -c 'import json,sys; value=json.load(sys.stdin); print(value.get("stage","idle")); print(value.get("status","")); print(value.get("artifactSha256") or "")'
+    )
+    last_stage="${last_event[0]:-idle}"
+    last_result="${last_event[1]:-}"
+    last_artifact_digest="${last_event[2]:-}"
+  fi
+  python3 - "${identity[0]}" "${identity[1]}" "${identity[2]}" \
+    "$current_version" "$previous_version" "$active" "$enabled" "$healthy" \
+    "$last_deployment" "$SCRIPT_VERSION" "$last_stage" "$last_result" \
+    "$last_artifact_digest" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "instanceName": sys.argv[1],
+    "environment": sys.argv[2],
+    "role": sys.argv[3],
+    "currentVersion": sys.argv[4],
+    "previousVersion": sys.argv[5],
+    "serviceActive": sys.argv[6] == "true",
+    "serviceEnabled": sys.argv[7] == "true",
+    "healthy": sys.argv[8] == "true",
+    "stage": sys.argv[11],
+    "lastDeploymentId": sys.argv[9] or None,
+    "scriptVersion": int(sys.argv[10]),
+    "lastResult": sys.argv[12] or None,
+    "lastArtifactSha256": sys.argv[13] or None
+}, separators=(",", ":")))
+PY
+}
+
+verify_release() {
+  local deployment_id="$1"
+  local staging="${STAGING_ROOT}/${deployment_id}"
+  local artifact="${staging}/release.tar.gz"
+  local manifest="${staging}/release-manifest.json"
+  local signature="${staging}/release-manifest.p7s"
+  local signer="${staging}/verified-signer.pem"
+
+  [[ -f "$artifact" && -f "$manifest" && -f "$signature" ]] || return 2
+  [[ -f "$TRUST_CERT" ]] || {
+    echo "trusted release certificate not found" >&2
+    return 1
+  }
+
+  openssl cms -verify -binary -inform DER \
+    -in "$signature" -content "$manifest" -noverify \
+    -signer "$signer" -out /dev/null >/dev/null 2>&1 || {
+      echo "release manifest signature verification failed" >&2
+      return 1
+    }
+  cmp \
+    <(openssl x509 -in "$signer" -outform DER) \
+    <(openssl x509 -in "$TRUST_CERT" -outform DER) >/dev/null || {
+      echo "release manifest signer is not pinned" >&2
+      return 1
+    }
+
+  if ! python3 - "$manifest" "$artifact" <<'PY'
+import hashlib
+import json
+import re
+import sys
+manifest_path, artifact_path = sys.argv[1:3]
+with open(manifest_path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+required = {
+    "schemaVersion", "version", "buildCommit", "targetRuntime",
+    "artifactFile", "artifactSha256", "createdUtc"
+}
+if set(value) != required:
+    raise SystemExit("release manifest fields are invalid")
+if value["schemaVersion"] != 1:
+    raise SystemExit("unsupported release manifest schema")
+if value["targetRuntime"] != "linux-x64":
+    raise SystemExit("release runtime must be linux-x64")
+if value["artifactFile"] != "release.tar.gz":
+    raise SystemExit("release artifact filename is invalid")
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", value["version"]):
+    raise SystemExit("release version is invalid")
+if not re.fullmatch(r"[0-9a-fA-F]{7,40}", value["buildCommit"]):
+    raise SystemExit("release commit is invalid")
+digest = hashlib.sha256()
+with open(artifact_path, "rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+actual = digest.hexdigest()
+if not re.fullmatch(r"[0-9a-f]{64}", value["artifactSha256"]):
+    raise SystemExit("release SHA-256 format is invalid")
+if actual != value["artifactSha256"]:
+    raise SystemExit("release SHA-256 mismatch")
+PY
+  then
+    return 1
+  fi
+
+  if ! tar -tzf "$artifact" | while IFS= read -r entry; do
+    [[ "$entry" != /* && "$entry" != ../* && "$entry" != *"/../"* ]] || {
+      echo "release archive contains an unsafe path" >&2
+      return 1
+    }
+  done; then
+    return 1
+  fi
+}
+
+prepare_extracted_release() {
+  local deployment_id="$1"
+  local staging="${STAGING_ROOT}/${deployment_id}"
+  local extracted="${staging}/extracted"
+  rm -rf "$extracted"
+  mkdir -p "$extracted"
+  tar -xzf "${staging}/release.tar.gz" -C "$extracted" --no-same-owner
+  [[ -f "${extracted}/angel-eye-bridge" ]] || {
+    echo "release executable is missing" >&2
+    return 1
+  }
+  chmod 0755 "${extracted}/angel-eye-bridge"
+  if ! "${extracted}/angel-eye-bridge" \
+    --config "$CONFIG_PATH" --check-config >/dev/null; then
+    return 1
+  fi
+  cp "${staging}/release-manifest.json" "${extracted}/.release-manifest.json"
+}
+
+preflight_action() {
+  local deployment_id="$1"
+  local staging="${STAGING_ROOT}/${deployment_id}"
+  mkdir -p "$staging"
+  local result=0
+  verify_release "$deployment_id" || result=$?
+  if [[ "$result" != "0" ]]; then
+    if [[ "$result" == "2" ]]; then
+      json_emit "$deployment_id" "staging" "ready" "staging directory prepared"
+      return 0
+    fi
+    json_emit "$deployment_id" "verify" "failed" "release verification failed"
+    return 65
+  fi
+  prepare_extracted_release "$deployment_id" || {
+    json_emit "$deployment_id" "config-check" "failed" "staged Worker config check failed"
+    return 65
+  }
+  local digest version
+  digest="$(read_manifest_field "${staging}/release-manifest.json" artifactSha256)"
+  version="$(read_manifest_field "${staging}/release-manifest.json" version)"
+  printf '%s\n%s\n' "$digest" "$version" > "${staging}/preflight.ok"
+  json_emit "$deployment_id" "preflight" "succeeded" "release verified" "" "$version"
+}
+
+backup_persistent_state() {
+  local deployment_id="$1"
+  local prior_active="$2"
+  local prior_enabled="$3"
+  local backup="${BACKUP_ROOT}/${deployment_id}"
+  mkdir -p "$backup"
+  if [[ -L "$CURRENT_LINK" ]]; then
+    readlink -f "$CURRENT_LINK" > "${backup}/previous-current"
+  fi
+  echo "$prior_active" > "${backup}/service-active"
+  echo "$prior_enabled" > "${backup}/service-enabled"
+  cp -a "$CONFIG_PATH" "${backup}/appsettings.json"
+  cp -a "${STAGING_ROOT}/${deployment_id}/release-manifest.json" \
+    "${backup}/release-manifest.json"
+  [[ -f "${VAR_ROOT}/bridge-state.json" ]] &&
+    cp -a "${VAR_ROOT}/bridge-state.json" "${backup}/bridge-state.json"
+  if [[ -f "${VAR_ROOT}/bridge-events.sqlite" ]]; then
+    if command -v sqlite3 >/dev/null 2>&1; then
+      sqlite3 "${VAR_ROOT}/bridge-events.sqlite" ".backup '${backup}/bridge-events.sqlite'"
+    else
+      cp -a "${VAR_ROOT}/bridge-events.sqlite" "${backup}/bridge-events.sqlite"
+    fi
+  fi
+}
+
+switch_current() {
+  local release_path="$1"
+  mkdir -p "$OPT_ROOT"
+  local temporary="${OPT_ROOT}/.current.$$.tmp"
+  ln -s "$release_path" "$temporary"
+  mv -Tf "$temporary" "$CURRENT_LINK"
+}
+
+rollback_internal() {
+  local deployment_id="$1"
+  local backup="${BACKUP_ROOT}/${deployment_id}"
+  [[ -f "${backup}/previous-current" ]] || {
+    echo "previous release record is missing" >&2
+    return 1
+  }
+  local previous
+  previous="$(<"${backup}/previous-current")"
+  [[ -d "$previous" ]] || {
+    echo "previous release directory is missing" >&2
+    return 1
+  }
+  switch_current "$previous"
+  if [[ "$(<"${backup}/service-enabled")" == "enabled" ]]; then
+    systemctl enable "$SERVICE_NAME" >/dev/null
+  else
+    systemctl disable "$SERVICE_NAME" >/dev/null
+  fi
+  if [[ "$(<"${backup}/service-active")" == "active" ]]; then
+    systemctl restart "$SERVICE_NAME"
+    wait_for_health
+  else
+    systemctl stop "$SERVICE_NAME" >/dev/null
+  fi
+}
+
+install_action() {
+  local deployment_id="$1"
+  local staging="${STAGING_ROOT}/${deployment_id}"
+  [[ -f "${staging}/preflight.ok" && -d "${staging}/extracted" ]] || {
+    json_emit "$deployment_id" "install" "failed" "preflight marker is missing"
+    return 65
+  }
+  local version digest release_path previous_version
+  version="$(read_manifest_field "${staging}/release-manifest.json" version)"
+  digest="$(read_manifest_field "${staging}/release-manifest.json" artifactSha256)"
+  release_path="${RELEASES_ROOT}/${version}-${digest:0:12}"
+  previous_version="$(release_version "$CURRENT_LINK")"
+
+  mapfile -t identity < <(read_identity)
+  local standby=false
+  [[ "${identity[2]}" == "Standby" ]] && standby=true
+  local prior_active="inactive" prior_enabled="disabled"
+  service_is_active && prior_active="active"
+  service_is_enabled && prior_enabled="enabled"
+
+  if [[ "$standby" == "false" ]] && service_is_active; then
+    systemctl stop "$SERVICE_NAME"
+  fi
+  backup_persistent_state "$deployment_id" "$prior_active" "$prior_enabled"
+  mkdir -p "$RELEASES_ROOT"
+  if [[ ! -d "$release_path" ]]; then
+    mv "${staging}/extracted" "$release_path"
+  fi
+  if [[ -L "$CURRENT_LINK" ]]; then
+    ln -sfn "$(readlink -f "$CURRENT_LINK")" "$PREVIOUS_LINK"
+  fi
+  switch_current "$release_path"
+
+  if [[ "$standby" == "true" ]]; then
+    systemctl disable --now "$SERVICE_NAME" >/dev/null
+    json_emit "$deployment_id" "install" "succeeded" \
+      "standby release installed and kept inactive" \
+      "$previous_version" "$version"
+    return 0
+  fi
+
+  systemctl enable "$SERVICE_NAME" >/dev/null
+  if systemctl restart "$SERVICE_NAME" && wait_for_health; then
+    json_emit "$deployment_id" "health" "succeeded" \
+      "Worker release is healthy" "$previous_version" "$version"
+    return 0
+  fi
+
+  json_emit "$deployment_id" "health" "failed" \
+    "new release failed health verification; rolling back" \
+    "$previous_version" "$version"
+  if rollback_internal "$deployment_id"; then
+    json_emit "$deployment_id" "rollback" "succeeded" \
+      "previous release restored" "$previous_version" "$version" true
+    return 70
+  fi
+  json_emit "$deployment_id" "rollback" "failed" \
+    "automatic rollback failed" "$previous_version" "$version" true \
+    "${BACKUP_ROOT}/${deployment_id}"
+  return 71
+}
+
+rollback_action() {
+  local deployment_id="$1"
+  local previous_version target_version
+  previous_version="$(release_version "$CURRENT_LINK")"
+  target_version=""
+  if rollback_internal "$deployment_id"; then
+    target_version="$(release_version "$CURRENT_LINK")"
+    json_emit "$deployment_id" "rollback" "succeeded" \
+      "recorded previous release restored" \
+      "$previous_version" "$target_version" true
+    return 0
+  fi
+  json_emit "$deployment_id" "rollback" "failed" \
+    "manual rollback failed" "$previous_version" "$target_version" true \
+    "${BACKUP_ROOT}/${deployment_id}"
+  return 71
+}
+
+main() {
+  require_command python3
+  local action="${1:-}"
+  case "$action" in
+    status)
+      [[ "$#" == "1" ]] || exit 64
+      status_action
+      ;;
+    preflight|install|rollback)
+      [[ "$#" == "2" ]] || exit 64
+      validate_deployment_id "$2"
+      require_command openssl
+      require_command tar
+      case "$action" in
+        preflight) preflight_action "$2" ;;
+        install) install_action "$2" ;;
+        rollback) rollback_action "$2" ;;
+      esac
+      ;;
+    *)
+      echo "usage: angel-eye-worker-deploy status|preflight|install|rollback [deployment-id]" >&2
+      exit 64
+      ;;
+  esac
+}
+
+main "$@"
