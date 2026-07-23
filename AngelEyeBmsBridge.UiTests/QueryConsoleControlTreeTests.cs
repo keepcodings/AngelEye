@@ -50,6 +50,35 @@ public sealed class QueryConsoleControlTreeTests
         Assert.True(EngineeringCommandPolicy.CanSend(mockMode: false, allowPhysicalShoeCommands: true));
     }
 
+    [Fact]
+    public void QueryConsole_LongOfflineMessage_StaysInsideHeaderWithoutWrappingControls()
+    {
+        RunSta(() =>
+        {
+            using QueryConsoleForm form = new(autoStartQueries: false)
+            {
+                WindowState = FormWindowState.Normal,
+                Size = new Size(1920, 1200)
+            };
+            form.Show();
+            Application.DoEvents();
+
+            Label connection = GetPrivateField<Label>(form, "_connectionBanner");
+            Label source = GetPrivateField<Label>(form, "_sourceBanner");
+            connection.Text = "牌局查詢失敗；篩選條件與既有資料已保留（No connection could be made because the target machine actively refused it.）";
+            form.PerformLayout();
+            connection.Parent!.PerformLayout();
+            Application.DoEvents();
+
+            Assert.NotSame(source.Parent, connection.Parent);
+            Assert.False(connection.AutoSize);
+            Assert.True(connection.AutoEllipsis);
+            Assert.True(connection.Width <= connection.Parent.ClientSize.Width);
+            Assert.True(connection.Bottom <= connection.Parent.ClientSize.Height);
+            Assert.True(connection.PointToScreen(Point.Empty).Y >= source.PointToScreen(Point.Empty).Y + source.Height);
+        });
+    }
+
     private static IEnumerable<Control> Descendants(Control parent)
     {
         foreach (Control child in parent.Controls)
@@ -84,4 +113,9 @@ public sealed class QueryConsoleControlTreeTests
             throw new TargetInvocationException(failure);
         }
     }
+
+    private static T GetPrivateField<T>(object instance, string fieldName) where T : class =>
+        Assert.IsType<T>(instance.GetType()
+            .GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(instance));
 }

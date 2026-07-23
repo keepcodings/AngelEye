@@ -11,7 +11,16 @@ public sealed class QueryConsoleForm : Form
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 5000 };
     private readonly ComboBox _profile = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 155 };
     private readonly Label _sourceBanner = new() { Text = "來源尚未確認", AutoSize = true, Font = new Font("Microsoft JhengHei", 11F, FontStyle.Bold), ForeColor = Color.Gold, Margin = new Padding(12, 6, 0, 0) };
-    private readonly Label _connectionBanner = new() { Text = "尚未連線", AutoSize = true, ForeColor = Color.FromArgb(210, 220, 230), Margin = new Padding(12, 8, 0, 0) };
+    private readonly Label _connectionBanner = new()
+    {
+        Text = "尚未連線",
+        AutoSize = false,
+        AutoEllipsis = true,
+        Dock = DockStyle.Fill,
+        ForeColor = Color.FromArgb(210, 220, 230),
+        TextAlign = ContentAlignment.MiddleRight,
+        Padding = new Padding(0, 0, 2, 0)
+    };
     private readonly DataGridView _dashboard = CreateGrid();
     private readonly DataGridView _rounds = CreateGrid();
     private readonly DataGridView _timeline = CreateGrid();
@@ -101,12 +110,24 @@ public sealed class QueryConsoleForm : Form
             ForeColor = Color.White,
             Location = new Point(16, 8)
         };
-        FlowLayoutPanel headerActions = new()
+        TableLayoutPanel headerStatus = new()
         {
             Dock = DockStyle.Right,
-            Width = 620,
+            Width = 760,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Color.Transparent,
+            Padding = new Padding(0)
+        };
+        headerStatus.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        headerStatus.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        headerStatus.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        FlowLayoutPanel headerActions = new()
+        {
+            Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
-            Padding = new Padding(0, 7, 0, 0),
+            WrapContents = false,
+            Padding = new Padding(0, 2, 0, 0),
             BackColor = Color.Transparent
         };
         Label profileLabel = new() { Text = "查詢來源", AutoSize = true, ForeColor = Color.White, Margin = new Padding(0, 8, 6, 0) };
@@ -123,9 +144,10 @@ public sealed class QueryConsoleForm : Form
         headerActions.Controls.Add(_profile);
         headerActions.Controls.Add(refresh);
         headerActions.Controls.Add(_sourceBanner);
-        headerActions.Controls.Add(_connectionBanner);
+        headerStatus.Controls.Add(headerActions, 0, 0);
+        headerStatus.Controls.Add(_connectionBanner, 0, 1);
         header.Controls.Add(title);
-        header.Controls.Add(headerActions);
+        header.Controls.Add(headerStatus);
         Controls.Add(header);
 
         TabControl tabs = new()
