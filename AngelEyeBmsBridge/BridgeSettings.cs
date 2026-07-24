@@ -467,8 +467,8 @@ public sealed class ShoeEndpointSettings
         return tableNumber switch
         {
             901 => CreateMoxaEndpoint("901桌", "901", "SHOE901", moxaHost, "9d1f77f4-4f00-40ce-bda6-8cd6476a2ad4", bmsTransmitEnabled: true),
-            902 => CreateMoxaEndpoint("902桌", "902", "SHOE902", moxaHost, "9ed122db-7622-42bf-a4cc-c84a2503a351"),
-            903 => CreateMoxaEndpoint("903桌", "903", "SHOE903", moxaHost, "5c3762c6-ea07-44a1-b6ad-b4467b1fdddd"),
+            902 => CreateMoxaEndpoint("902桌", "902", "SHOE902", moxaHost, "9ed122db-7622-42bf-a4cc-c84a2503a351", bmsTransmitEnabled: true),
+            903 => CreateMoxaEndpoint("903桌", "903", "SHOE903", moxaHost, "5c3762c6-ea07-44a1-b6ad-b4467b1fdddd", bmsTransmitEnabled: true),
             _ => CreateMoxaEndpoint($"{tableNumber}桌", tableNumber.ToString(), $"SHOE{tableNumber}", moxaHost)
         };
     }

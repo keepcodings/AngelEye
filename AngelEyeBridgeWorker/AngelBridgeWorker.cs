@@ -32,6 +32,12 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private Task? _healthTask;
     private CancellationTokenSource? _runCts;
 
+    internal bool IsBmsDispatcherRunning => _bmsApiClient.IsRunning;
+
+    internal IReadOnlyList<ShoeEndpoint> Endpoints => _endpoints;
+
+    internal BridgeEventJournal Journal => _journal;
+
     public AngelBridgeWorker(WorkerSettings settings)
     {
         _settings = settings;
@@ -66,7 +72,14 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
         Log("SYS", $"Bridge starting. db={_journal.DbPath}");
         Log("SYS", $"State file: {_stateStore.Path}");
-        StartBmsDispatcher();
+        if (HasAuthorizedBmsSender())
+        {
+            StartBmsDispatcher();
+        }
+        else
+        {
+            Log("SYS", "All BMS transmission is disabled; dispatcher not started.");
+        }
 
         if (_settings.Health.Enabled)
         {
@@ -496,9 +509,9 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         return queued;
     }
 
-    private async Task<bool> PublishBridgeEventAsync(string type, ShoeEndpoint endpoint, object data, Action<Dictionary<string, object?>>? configureRoot = null)
+    internal async Task<bool> PublishBridgeEventAsync(string type, ShoeEndpoint endpoint, object data, Action<Dictionary<string, object?>>? configureRoot = null)
     {
-        if (!endpoint.BmsTransmitEnabled)
+        if (!IsAuthorizedBmsSender(endpoint))
         {
             Log(endpoint, "API", $"BMS 傳送已關閉，略過 {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
             return false;
@@ -618,7 +631,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
     private static string GetEndpointKey(ShoeEndpoint endpoint) => $"{endpoint.SourceDataCode}:{endpoint.DeviceId}";
 
-    private async Task<BridgeCommandHandlingResult> HandleBmsCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
+    internal async Task<BridgeCommandHandlingResult> HandleBmsCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         DateTimeOffset observedAt = DateTimeOffset.UtcNow;
@@ -708,10 +721,10 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         ShoeEndpoint? endpoint = FindEndpointForCommand(command);
         if (endpoint == null)
         {
-            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found.");
+            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found or was ambiguous.");
         }
 
-        if (!endpoint.BmsTransmitEnabled)
+        if (!IsAuthorizedBmsSender(endpoint))
         {
             return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
         }
@@ -761,6 +774,29 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         cancellationToken.ThrowIfCancellationRequested();
         if (command.EventId.HasValue)
         {
+            BridgeStoredEventIdentity? identity = await _journal
+                .GetEventIdentityAsync(command.EventId.Value)
+                .ConfigureAwait(false);
+            if (identity == null)
+            {
+                return BridgeCommandHandlingResult.NotFound($"EventId {command.EventId.Value} was not found locally.");
+            }
+
+            // Event-ID resend authorization is based on the immutable identity stored with the
+            // event. Command-supplied desk/device fields must never redirect an event to another desk.
+            ShoeEndpoint? storedEndpoint = FindEndpointForStoredEvent(identity);
+            if (storedEndpoint == null)
+            {
+                return BridgeCommandHandlingResult.NotFound(
+                    $"EventId {command.EventId.Value} endpoint was not found or was ambiguous.");
+            }
+
+            if (!IsAuthorizedBmsSender(storedEndpoint))
+            {
+                return BridgeCommandHandlingResult.Rejected(
+                    $"EventId {command.EventId.Value} endpoint has BMS transmission disabled.");
+            }
+
             int requeuedById = await _journal
                 .RequeueEventAsync(command.EventId.Value, DateTime.UtcNow, $"BMS command {command.CommandId} ResendEvent")
                 .ConfigureAwait(false);
@@ -769,7 +805,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                 return BridgeCommandHandlingResult.NotFound($"EventId {command.EventId.Value} was not found locally.");
             }
 
-            Log(FindEndpointForCommand(command), "API", $"BMS 要求重送事件 #{command.EventId.Value}，已重新排送。");
+            Log(storedEndpoint, "API", $"BMS 要求重送事件 #{command.EventId.Value}，已重新排送。");
             _ = RefreshOutboxStatusesAsync();
             return BridgeCommandHandlingResult.Handled($"Requeued event #{command.EventId.Value}.");
         }
@@ -777,10 +813,10 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         ShoeEndpoint? endpoint = FindEndpointForCommand(command);
         if (endpoint == null)
         {
-            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found.");
+            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found or was ambiguous.");
         }
 
-        if (!endpoint.BmsTransmitEnabled)
+        if (!IsAuthorizedBmsSender(endpoint))
         {
             return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
         }
@@ -816,22 +852,46 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
     private ShoeEndpoint? FindEndpointForCommand(AngelBridgeCommand command)
     {
-        return _endpoints.FirstOrDefault(endpoint =>
+        if (string.IsNullOrWhiteSpace(command.SourceDataCode) &&
+            string.IsNullOrWhiteSpace(command.DeviceId))
+        {
+            return null;
+        }
+
+        ShoeEndpoint[] matches = _endpoints.Where(endpoint =>
             (string.IsNullOrWhiteSpace(command.SourceDataCode) ||
                 string.Equals(endpoint.SourceDataCode, command.SourceDataCode, StringComparison.OrdinalIgnoreCase)) &&
             (string.IsNullOrWhiteSpace(command.DeviceId) ||
                 string.Equals(endpoint.DeviceId, command.DeviceId, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(endpoint.ShoeId, command.DeviceId, StringComparison.OrdinalIgnoreCase)));
+                string.Equals(endpoint.ShoeId, command.DeviceId, StringComparison.OrdinalIgnoreCase)))
+            .Take(2)
+            .ToArray();
+        return matches.Length == 1 ? matches[0] : null;
     }
 
-    private bool IsEventDispatchEnabled(BridgePendingEvent pending)
+    private ShoeEndpoint? FindEndpointForStoredEvent(BridgeStoredEventIdentity identity)
+    {
+        ShoeEndpoint[] matches = _endpoints.Where(endpoint =>
+                string.Equals(endpoint.SourceDataCode, identity.SourceDataCode, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(endpoint.DeviceId, identity.DeviceId, StringComparison.OrdinalIgnoreCase))
+            .Take(2)
+            .ToArray();
+        return matches.Length == 1 ? matches[0] : null;
+    }
+
+    internal bool IsEventDispatchEnabled(BridgePendingEvent pending)
     {
         ShoeEndpoint? endpoint = _endpoints.FirstOrDefault(candidate =>
             string.Equals(candidate.SourceDataCode, pending.SourceDataCode, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(candidate.DeviceId, pending.DeviceId, StringComparison.OrdinalIgnoreCase));
 
-        return endpoint?.BmsTransmitEnabled ?? true;
+        return IsAuthorizedBmsSender(endpoint);
     }
+
+    internal bool HasAuthorizedBmsSender() => _endpoints.Any(IsAuthorizedBmsSender);
+
+    internal static bool IsAuthorizedBmsSender(ShoeEndpoint? endpoint) =>
+        endpoint is { Enabled: true, BmsTransmitEnabled: true };
 
     private async Task RunHealthServerAsync(CancellationToken cancellationToken)
     {

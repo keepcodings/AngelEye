@@ -5,13 +5,14 @@
 - `AngelEyeBmsBridge/`：Windows 11 GUI 版，用於現場連線、診斷與接收測試。
 - `AngelEyeBridgeWorker/`：Ubuntu headless worker，用於正式環境長時間背景執行。
 
-目前設計重點是先確認牌盒資料能穩定進入橋接程式，再視需要開啟 BMS 傳送。
+目前設計重點是確認牌盒資料能穩定進入橋接程式，並以每桌授權開關控制 BMS 傳送。
 
 ## 目前安全狀態
 
-- BMS 傳送預設關閉。
 - Ubuntu worker 範例設定中 `bridge.readOnly` 為 `true`。
-- 各桌 `bmsTransmitEnabled` 預設為 `false`。
+- PIT9 的 901、902、903 已明確開啟 `bmsTransmitEnabled`；QA 桌維持關閉。
+- 若全部啟用桌台的 `bmsTransmitEnabled` 都是 `false`，Worker 不會建立 BMS dispatcher、heartbeat 或命令輪詢，但 MOXA 接收、解析及 Health／Query API 仍可運作。
+- 找不到桌台、桌台停用或 BMS 開關關閉時，事件傳送與補送一律 fail closed。
 - read-only 模式下不會對牌盒送 OP 控制指令。
 - 診斷時以接收資料、顯示 `RXRAW` / `RX` / `EVENT` 為主。
 
@@ -152,7 +153,7 @@ ENQ  Seq  Data  ETX  BCC
 
 ## 部署提醒
 
-- 同一台 MOXA 測試時，盡量只開一個 TCP client，避免資料被其他連線消耗或造成判讀混亂。
-- QA 目前 Max connection 為 `1`，更需要避免同時連線。
+- NPort 現場設定可同時接受 4 條連線；每個 Worker／Query Console process 對同一桌仍只建立 1 條連線。
+- Worker 是唯一 BMS sender；額外 Query Console 連線只做唯讀監看。
 - 若 `RxTotalCnt` 有歷史累計，不代表當下仍有資料；測試時應同步比較發牌前後的差值。
 - 正式開啟 BMS 傳送前，請確認每桌 `RXRAW`、`RX`、`EVENT` 都正常。

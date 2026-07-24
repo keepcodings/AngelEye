@@ -615,6 +615,35 @@ public sealed partial class BridgeEventJournal
     }
 
     /// <summary>
+    /// Reads the endpoint identity persisted with one local event before a resend is authorized.
+    /// </summary>
+    /// <param name="eventId">Local event ID.</param>
+    /// <returns>The stored endpoint identity, or <see langword="null"/> when the event does not exist.</returns>
+    public async Task<BridgeStoredEventIdentity?> GetEventIdentityAsync(long eventId)
+    {
+        await using SqliteConnection connection = CreateConnection();
+        await connection.OpenAsync().ConfigureAwait(false);
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT event_id, desk_id, device_id
+            FROM bridge_events
+            WHERE event_id = $event_id
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$event_id", eventId);
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+        if (!await reader.ReadAsync().ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return new BridgeStoredEventIdentity(
+            reader.GetInt64(0),
+            reader.GetString(1),
+            reader.GetString(2));
+    }
+
+    /// <summary>
     /// Requeues stored events matching a recovery or resend query.
     /// </summary>
     /// <param name="query">Filter and paging options; the newest matching rows are requeued first.</param>
@@ -1136,6 +1165,17 @@ public sealed record BridgePendingEvent(
     long Round,
     string PayloadJson,
     int RetryCount);
+
+/// <summary>
+/// Identifies the endpoint that originally created a stored bridge event.
+/// </summary>
+/// <param name="EventId">Local event ID.</param>
+/// <param name="SourceDataCode">BMS source table code stored with the event.</param>
+/// <param name="DeviceId">Bridge device identifier stored with the event.</param>
+public sealed record BridgeStoredEventIdentity(
+    long EventId,
+    string SourceDataCode,
+    string DeviceId);
 
 /// <summary>
 /// Summarizes local outbox delivery health for one endpoint.

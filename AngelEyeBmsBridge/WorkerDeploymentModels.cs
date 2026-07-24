@@ -31,7 +31,7 @@ public static class WorkerDeploymentTargets
                 "qa-29",
                 "QA .29",
                 "10.5.32.29",
-                22,
+                53229,
                 string.Empty,
                 "telebet-29",
                 "QA",

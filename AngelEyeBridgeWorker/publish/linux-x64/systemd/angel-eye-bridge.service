@@ -7,10 +7,10 @@ Wants=network-online.target
 Type=simple
 User=angelbridge
 Group=angelbridge
-WorkingDirectory=/opt/angel-eye-bridge
-Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+WorkingDirectory=/opt/angel-eye-bridge/current
+Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
 Environment=ANGEL_BRIDGE_CONFIG=/etc/angel-eye-bridge/appsettings.json
-ExecStart=/opt/angel-eye-bridge/angel-eye-bridge --config /etc/angel-eye-bridge/appsettings.json
+ExecStart=/opt/angel-eye-bridge/current/angel-eye-bridge --config /etc/angel-eye-bridge/appsettings.json
 Restart=always
 RestartSec=5
 KillSignal=SIGINT

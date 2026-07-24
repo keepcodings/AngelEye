@@ -10,7 +10,7 @@
       "angel-eye-bridge/1.0.0": {
         "dependencies": {
           "Microsoft.Data.Sqlite": "8.0.1",
-          "SQLitePCLRaw.bundle_e_sqlite3": "2.1.11",
+          "SQLitePCLRaw.bundle_e_sqlite3": "3.0.4",
           "System.IO.Ports": "10.0.8",
           "runtimepack.Microsoft.NETCore.App.Runtime.linux-x64": "10.0.2"
         },
@@ -760,12 +760,12 @@
       "Microsoft.Data.Sqlite/8.0.1": {
         "dependencies": {
           "Microsoft.Data.Sqlite.Core": "8.0.1",
-          "SQLitePCLRaw.bundle_e_sqlite3": "2.1.11"
+          "SQLitePCLRaw.bundle_e_sqlite3": "3.0.4"
         }
       },
       "Microsoft.Data.Sqlite.Core/8.0.1": {
         "dependencies": {
-          "SQLitePCLRaw.core": "2.1.11"
+          "SQLitePCLRaw.core": "3.0.4"
         },
         "runtime": {
           "lib/net8.0/Microsoft.Data.Sqlite.dll": {
@@ -786,41 +786,49 @@
           "runtime.linux-x64.runtime.native.System.IO.Ports": "10.0.8"
         }
       },
-      "SQLitePCLRaw.bundle_e_sqlite3/2.1.11": {
-        "dependencies": {
-          "SQLitePCLRaw.lib.e_sqlite3": "2.1.11",
-          "SQLitePCLRaw.provider.e_sqlite3": "2.1.11"
-        },
-        "runtime": {
-          "lib/netstandard2.0/SQLitePCLRaw.batteries_v2.dll": {
-            "assemblyVersion": "2.1.11.2622",
-            "fileVersion": "2.1.11.2622"
-          }
-        }
-      },
-      "SQLitePCLRaw.core/2.1.11": {
-        "runtime": {
-          "lib/netstandard2.0/SQLitePCLRaw.core.dll": {
-            "assemblyVersion": "2.1.11.2622",
-            "fileVersion": "2.1.11.2622"
-          }
-        }
-      },
-      "SQLitePCLRaw.lib.e_sqlite3/2.1.11": {
+      "SourceGear.sqlite3/3.53.3": {
         "native": {
+          "runtimes/linux-x64/native/libe_sqlite3.a": {
+            "fileVersion": "0.0.0.0"
+          },
           "runtimes/linux-x64/native/libe_sqlite3.so": {
             "fileVersion": "0.0.0.0"
           }
         }
       },
-      "SQLitePCLRaw.provider.e_sqlite3/2.1.11": {
+      "SQLitePCLRaw.bundle_e_sqlite3/3.0.4": {
         "dependencies": {
-          "SQLitePCLRaw.core": "2.1.11"
+          "SQLitePCLRaw.config.e_sqlite3": "3.0.4",
+          "SourceGear.sqlite3": "3.53.3"
+        }
+      },
+      "SQLitePCLRaw.config.e_sqlite3/3.0.4": {
+        "dependencies": {
+          "SQLitePCLRaw.provider.e_sqlite3": "3.0.4"
         },
         "runtime": {
-          "lib/net6.0/SQLitePCLRaw.provider.e_sqlite3.dll": {
-            "assemblyVersion": "2.1.11.2622",
-            "fileVersion": "2.1.11.2622"
+          "lib/net8.0/SQLitePCLRaw.batteries_v2.dll": {
+            "assemblyVersion": "3.0.4.3120",
+            "fileVersion": "3.0.4.3120"
+          }
+        }
+      },
+      "SQLitePCLRaw.core/3.0.4": {
+        "runtime": {
+          "lib/net8.0/SQLitePCLRaw.core.dll": {
+            "assemblyVersion": "3.0.4.3120",
+            "fileVersion": "3.0.4.3120"
+          }
+        }
+      },
+      "SQLitePCLRaw.provider.e_sqlite3/3.0.4": {
+        "dependencies": {
+          "SQLitePCLRaw.core": "3.0.4"
+        },
+        "runtime": {
+          "lib/net8.0/SQLitePCLRaw.provider.e_sqlite3.dll": {
+            "assemblyVersion": "3.0.4.3120",
+            "fileVersion": "3.0.4.3120"
           }
         }
       },
@@ -876,33 +884,40 @@
       "path": "runtime.native.system.io.ports/10.0.8",
       "hashPath": "runtime.native.system.io.ports.10.0.8.nupkg.sha512"
     },
-    "SQLitePCLRaw.bundle_e_sqlite3/2.1.11": {
+    "SourceGear.sqlite3/3.53.3": {
       "type": "package",
       "serviceable": true,
-      "sha512": "sha512-DC4nA7yWnf4UZdgJDF+9Mus4/cb0Y3Sfgi3gDnAoKNAIBwzkskNAbNbyu+u4atT0ruVlZNJfwZmwiEwE5oz9LQ==",
-      "path": "sqlitepclraw.bundle_e_sqlite3/2.1.11",
-      "hashPath": "sqlitepclraw.bundle_e_sqlite3.2.1.11.nupkg.sha512"
+      "sha512": "sha512-PaDT7JwQ00HmXZT1xSGSC0c24A5lVpJYHMrXBuJATdpB2t0nf4Kq9HyPaZhxVW0elPq4XI1s5BLh7qLuObmzFA==",
+      "path": "sourcegear.sqlite3/3.53.3",
+      "hashPath": "sourcegear.sqlite3.3.53.3.nupkg.sha512"
     },
-    "SQLitePCLRaw.core/2.1.11": {
+    "SQLitePCLRaw.bundle_e_sqlite3/3.0.4": {
       "type": "package",
       "serviceable": true,
-      "sha512": "sha512-PK0GLFkfhZzLQeR3PJf71FmhtHox+U3vcY6ZtswoMjrefkB9k6ErNJEnwXqc5KgXDSjige2XXrezqS39gkpQKA==",
-      "path": "sqlitepclraw.core/2.1.11",
-      "hashPath": "sqlitepclraw.core.2.1.11.nupkg.sha512"
+      "sha512": "sha512-gg8vENKV/o0pWLI0eJxnTA4X9e63rOvzkCDMAOePDGLieNSHPCGUiJ4CQDqDyNqIf6IPVzD4TOjqY5ACygZkkA==",
+      "path": "sqlitepclraw.bundle_e_sqlite3/3.0.4",
+      "hashPath": "sqlitepclraw.bundle_e_sqlite3.3.0.4.nupkg.sha512"
     },
-    "SQLitePCLRaw.lib.e_sqlite3/2.1.11": {
+    "SQLitePCLRaw.config.e_sqlite3/3.0.4": {
       "type": "package",
       "serviceable": true,
-      "sha512": "sha512-Ev2ytaXiOlWZ4b3R67GZBsemTINslLD1DCJr2xiacpn4tbapu0Q4dHEzSvZSMnVWeE5nlObU3VZN2p81q3XOYQ==",
-      "path": "sqlitepclraw.lib.e_sqlite3/2.1.11",
-      "hashPath": "sqlitepclraw.lib.e_sqlite3.2.1.11.nupkg.sha512"
+      "sha512": "sha512-W2HMmjAZ1v27fbyzZtONCdC8Ma/tTr5wLAIr4Iq7T4oKrYaI4occJ5TBhSdK4pltwBJLQBG5DcQMz+/w9X4bbg==",
+      "path": "sqlitepclraw.config.e_sqlite3/3.0.4",
+      "hashPath": "sqlitepclraw.config.e_sqlite3.3.0.4.nupkg.sha512"
     },
-    "SQLitePCLRaw.provider.e_sqlite3/2.1.11": {
+    "SQLitePCLRaw.core/3.0.4": {
       "type": "package",
       "serviceable": true,
-      "sha512": "sha512-Y/0ZkR+r0Cg3DQFuCl1RBnv/tmxpIZRU3HUvelPw6MVaKHwYYR8YNvgs0vuNuXCMvlyJ+Fh88U1D4tah1tt6qw==",
-      "path": "sqlitepclraw.provider.e_sqlite3/2.1.11",
-      "hashPath": "sqlitepclraw.provider.e_sqlite3.2.1.11.nupkg.sha512"
+      "sha512": "sha512-cOjxfdjE4zQDvDVDUBfucKGXEaYos4l4l+TVwePJEHp/nl9fkgBz/lIVgfMH5dOyKRmNi6RsptUGtZsvsD7iYQ==",
+      "path": "sqlitepclraw.core/3.0.4",
+      "hashPath": "sqlitepclraw.core.3.0.4.nupkg.sha512"
+    },
+    "SQLitePCLRaw.provider.e_sqlite3/3.0.4": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-L4uiEKeRSXxppkGE4iSpgBgC5lNvw2zEN/hAaxTecUS1+DhC6UEFhHaakSYYvnFq7x16B7DQcaXgXy0SkhSwnw==",
+      "path": "sqlitepclraw.provider.e_sqlite3/3.0.4",
+      "hashPath": "sqlitepclraw.provider.e_sqlite3.3.0.4.nupkg.sha512"
     },
     "System.IO.Ports/10.0.8": {
       "type": "package",

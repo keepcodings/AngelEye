@@ -142,12 +142,12 @@ public sealed class QueryConsoleControlTreeTests
         Assert.Equal(
             new[]
             {
-                "qa-29|10.5.32.29|QA|Primary|False",
-                "production-30|10.5.32.30|Production|Primary|False",
-                "standby-31|10.5.32.31|Production|Standby|True"
+                "qa-29|10.5.32.29:53229|QA|Primary|False",
+                "production-30|10.5.32.30:22|Production|Primary|False",
+                "standby-31|10.5.32.31:22|Production|Standby|True"
             },
             WorkerDeploymentTargets.All.Select(target =>
-                $"{target.Id}|{target.Host}|{target.ExpectedEnvironment}|{target.ExpectedRole}|{target.IsStandby}"));
+                $"{target.Id}|{target.Host}:{target.SshPort}|{target.ExpectedEnvironment}|{target.ExpectedRole}|{target.IsStandby}"));
 
         string[] propertyNames = typeof(WorkerDeploymentTarget)
             .GetProperties()

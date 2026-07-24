@@ -36,6 +36,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable angel-eye-bridge
 ```
 
+Worker 以 invariant globalization 發佈與執行，不依賴作業系統的 `libicu`。Rocky Linux 無法連外安裝套件時仍可執行 `--check-config`；但 BMS hostname 必須能由主機 DNS 解析，否則只會持續累積本機 outbox，不得把 DNS 失敗誤判成程式或設定檔錯誤。
+
 ## 工程部署模式的首次佈建
 
 這一節由 Linux 管理員在 `.29`、`.30`、`.31` 各做一次。GUI 不取得任意 shell；它只能用 `angeldeploy` 帳號呼叫固定的 root-owned script。
@@ -85,7 +87,7 @@ sudo systemctl disable --now angel-eye-bridge
 在隔離管道向 Linux 管理員取得每台 VM 的 SSH host public key fingerprint，再與工程工作站掃描結果逐字核對。不可只信任第一次網路掃描的值。
 
 ```powershell
-ssh-keyscan -p 22 10.5.32.29 | ssh-keygen -lf - -E sha256
+ssh-keyscan -p 53229 10.5.32.29 | ssh-keygen -lf - -E sha256
 ssh-keyscan -p 22 10.5.32.30 | ssh-keygen -lf - -E sha256
 ssh-keyscan -p 22 10.5.32.31 | ssh-keygen -lf - -E sha256
 ```
@@ -228,7 +230,7 @@ sudo systemctl start angel-eye-bridge
 
 目前套件內有三份 Midori / PIT9 設定範本：
 
-- `appsettings.server-29.qa.example.json`：`10.5.32.29` QA；送往 `redhood67.infinitybeyonder888test.com`。包含 901 / 902 / 903 / QA，目前只有 901 開啟 BMS 傳送。
+- `appsettings.server-29.qa.example.json`：`10.5.32.29` QA；送往 `redhood67.infinitybeyonder888test.com`。901 / 902 / 903 開啟 BMS 傳送，QA 桌關閉。
 - `appsettings.server-30.production.example.json`：`10.5.32.30` 正式主機；送往 `redhood67.infinitybeyonder888.com`。包含 901 / 902 / 903。
 - `appsettings.server-31.standby.example.json`：`10.5.32.31` 正式備援；設定與正式主機相同，但 systemd 平時必須保持停止與停用。
 
@@ -252,6 +254,10 @@ QA  -> 10.5.32.124:4001, NPort 5110, 9600 8N1 None
 備援切換時，必須先停止 `10.5.32.30` 的服務，再啟用 `10.5.32.31`，避免兩台同時讀取相同牌盒並重複送事件。
 
 同一張桌同一時間只能有一個 **Worker／Bridge sender**，避免 BMS 收到重複牌訊。NPort 現場已確認可同時接受 4 條連線，因此可另有 Query Console 的唯讀監看連線；監看連線不會送牌盒命令、寫 SQLite 或 POST BMS。
+
+`bridge.readOnly=true` 只禁止對實體牌盒送控制指令，不禁止 BMS 對本機 SQLite outbox 執行 `RecoverRound`／`ResendEvent`。所有補送仍必須先通過該事件所屬桌台的 `enabled && bmsTransmitEnabled` 授權；Event ID 的授權以資料庫內原始桌碼／牌盒 ID 為準，命令帶入的桌碼不能改向或繞過開關。
+
+若所有啟用桌台的 `bmsTransmitEnabled=false`，Worker 不建立 BMS dispatcher、heartbeat 或命令輪詢。MOXA 連線、牌盒解析、`/health` 與 `/api/v1/*` 查詢仍正常；這種模式也不會新增 BMS outbox 事件。重新開啟任一桌後必須重新啟動 Worker，dispatcher 才會建立。
 
 ## Query Console 的 MOXA 即時監看
 
