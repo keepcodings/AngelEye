@@ -366,6 +366,30 @@ journalctl -u angel-eye-bridge -n 200 --no-pager
 journalctl -u angel-eye-bridge --since today --no-pager
 ```
 
+Worker 會將 stdout/stderr 明確送進 systemd journal。一般事件以 `eventUid` 關聯 Worker 與 BMS；補單以
+`commandId + generation + dispatchCount` 關聯；每次 HTTP request 另帶 `X-Correlation-ID`，BMS
+會將同值寫入結構化 Log。例外 Log 會包含例外類型與已脫敏的 stack trace，不會顯示 client secret、
+JWT、token、signing key 或 SSH 密碼。
+
+```bash
+# 查單一事件
+journalctl -u angel-eye-bridge --since today --no-pager | grep -F 'eventUid=<EVENT_UID>'
+
+# 查單一補單命令
+journalctl -u angel-eye-bridge --since today --no-pager | grep -F 'commandId=<COMMAND_ID>'
+```
+
+Runtime Log 保留期限由主機的 journald policy 管理，不由 Worker 自動刪除。QA／Production 部署前，
+主機管理者必須確認可涵蓋事故調查窗口（建議至少 30 天），並限制總使用量：
+
+```bash
+journalctl --disk-usage
+systemd-analyze cat-config systemd/journald.conf
+```
+
+若要調整 `MaxRetentionSec`／`SystemMaxUse`，必須由主機管理者審核；這是整台主機的 journal
+政策，不可由 Worker 更新流程擅自修改。
+
 ## 健康檢查
 
 預設本機開 `127.0.0.1:18080`：

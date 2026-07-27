@@ -2752,28 +2752,9 @@ public sealed partial class BridgeEventJournal
 
     private static string RedactForStore(string text)
     {
-        string normalized = TrimForStore(text);
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            return string.Empty;
-        }
-
-        normalized = Regex.Replace(
-            normalized,
-            @"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
-            "$1[REDACTED]",
-            RegexOptions.CultureInvariant);
-        normalized = Regex.Replace(
-            normalized,
-            @"(?i)((?:signing[_ -]?key|jwt|token)\s*[:=]\s*)(?:""[^""]*""|'[^']*'|[^\s,;]+)",
-            "$1[REDACTED]",
-            RegexOptions.CultureInvariant);
-        normalized = Regex.Replace(
-            normalized,
-            @"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
-            "[REDACTED]",
-            RegexOptions.CultureInvariant);
-        return normalized.Length <= 500 ? normalized : normalized[..500];
+        return BridgeDiagnosticFormatter.SanitizeForLog(
+            TrimForStore(text),
+            maxLength: 500);
     }
 
     private static int ToInt32(long value)

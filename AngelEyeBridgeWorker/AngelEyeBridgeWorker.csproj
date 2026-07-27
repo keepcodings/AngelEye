@@ -20,6 +20,7 @@
     <Compile Include="..\AngelEyeBmsBridge\AngelEyeProtocol.cs" Link="Shared\AngelEyeProtocol.cs" />
     <Compile Include="..\AngelEyeBmsBridge\AngelEyeFrameDecoder.cs" Link="Shared\AngelEyeFrameDecoder.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BmsApiClient.cs" Link="Shared\BmsApiClient.cs" />
+    <Compile Include="..\AngelEyeBmsBridge\BridgeDiagnosticFormatter.cs" Link="Shared\BridgeDiagnosticFormatter.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeEventJournal.cs" Link="Shared\BridgeEventJournal.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeJournalQueries.cs" Link="Shared\BridgeJournalQueries.cs" />
     <Compile Include="..\AngelEyeBmsBridge\BridgeGameNumbering.cs" Link="Shared\BridgeGameNumbering.cs" />

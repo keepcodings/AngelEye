@@ -17,6 +17,7 @@ public sealed class BmsClientCredentialsAccessTokenProviderTests
         DateTimeOffset now = InitialNow;
         int requestCount = 0;
         string requestJson = string.Empty;
+        string correlationId = string.Empty;
         Uri? requestedUri = null;
         using BmsClientCredentialsAccessTokenProvider provider = new(
             "https://bms.test/api/source/angel/events?ignored=true",
@@ -27,6 +28,9 @@ public sealed class BmsClientCredentialsAccessTokenProviderTests
             {
                 Interlocked.Increment(ref requestCount);
                 requestedUri = request.RequestUri;
+                correlationId = request.Headers
+                    .GetValues(BridgeDiagnosticFormatter.CorrelationHeaderName)
+                    .Single();
                 requestJson = await request.Content!.ReadAsStringAsync();
                 return TokenResponse("token-1", now.AddMinutes(5), 300, "QA-29");
             }),
@@ -42,6 +46,7 @@ public sealed class BmsClientCredentialsAccessTokenProviderTests
         Assert.Equal("https", requestedUri.Scheme);
         Assert.Equal("/api/source/angel/token", requestedUri.AbsolutePath);
         Assert.Equal(string.Empty, requestedUri.Query);
+        Assert.StartsWith("angel-token-", correlationId, StringComparison.Ordinal);
 
         using JsonDocument request = JsonDocument.Parse(requestJson);
         Assert.Equal("angel-qa-29", request.RootElement.GetProperty("clientId").GetString());

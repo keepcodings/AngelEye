@@ -211,7 +211,8 @@ public sealed class BmsApiClient : IDisposable
             }
             catch (Exception ex)
             {
-                OnLogReceived?.Invoke($"Outbox dispatcher error: {ex.Message}");
+                OnLogReceived?.Invoke(
+                    $"Outbox dispatcher error: {BridgeDiagnosticFormatter.FormatException(ex)}");
                 await Task.Delay(IdleDelay, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -232,7 +233,8 @@ public sealed class BmsApiClient : IDisposable
         }
         catch (Exception ex)
         {
-            OnLogReceived?.Invoke($"事件 API URL 無效: {ex.Message}");
+            OnLogReceived?.Invoke(
+                $"事件 API URL 無效: {BridgeDiagnosticFormatter.FormatException(ex)}");
             return 0;
         }
 
@@ -341,7 +343,8 @@ public sealed class BmsApiClient : IDisposable
             {
                 _recoveryFailureCount++;
                 delay = CalculateRecoveryErrorDelay(_recoveryFailureCount);
-                OnLogReceived?.Invoke($"BMS 補償查詢 error: {ex.Message}，{delay.TotalSeconds:0} 秒後重試。");
+                OnLogReceived?.Invoke(
+                    $"BMS 補償查詢 error: {BridgeDiagnosticFormatter.FormatException(ex)}，{delay.TotalSeconds:0} 秒後重試。");
             }
 
             await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
@@ -362,7 +365,8 @@ public sealed class BmsApiClient : IDisposable
         }
         catch (Exception ex)
         {
-            OnLogReceived?.Invoke($"BMS 補償查詢 URL 無效: {ex.Message}");
+            OnLogReceived?.Invoke(
+                $"BMS 補償查詢 URL 無效: {BridgeDiagnosticFormatter.FormatException(ex)}");
             return DefaultRecoveryPollDelay;
         }
 
@@ -387,9 +391,11 @@ public sealed class BmsApiClient : IDisposable
             UnconfirmedEvents: authorizedCandidates.Select(ToUnconfirmedSummary).ToList());
 
         string json = JsonSerializer.Serialize(heartbeat, JsonOptions);
+        string correlationId = $"angel-poll-{Guid.NewGuid():N}";
         AuthenticatedPostResponse authenticated = await SendAuthenticatedPostAsync(
                 recoveryUri,
                 json,
+                correlationId,
                 cancellationToken)
             .ConfigureAwait(false);
         using HttpResponseMessage response = authenticated.Response;
@@ -398,7 +404,8 @@ public sealed class BmsApiClient : IDisposable
         {
             _recoveryFailureCount++;
             TimeSpan retryDelay = CalculateRecoveryErrorDelay(_recoveryFailureCount);
-            OnLogReceived?.Invoke($"BMS 補償查詢 -> {(int)response.StatusCode} {response.ReasonPhrase}，{retryDelay.TotalSeconds:0} 秒後重試。");
+            OnLogReceived?.Invoke(
+                $"BMS 補償查詢 correlationId={correlationId} -> {(int)response.StatusCode} {response.ReasonPhrase}，{retryDelay.TotalSeconds:0} 秒後重試。");
             return retryDelay;
         }
 
@@ -411,7 +418,8 @@ public sealed class BmsApiClient : IDisposable
         {
             _recoveryFailureCount++;
             TimeSpan retryDelay = CalculateRecoveryErrorDelay(_recoveryFailureCount);
-            OnLogReceived?.Invoke($"BMS 補償查詢 ACK JSON 無法解析: {ex.Message}，{retryDelay.TotalSeconds:0} 秒後重試。");
+            OnLogReceived?.Invoke(
+                $"BMS 補償查詢 correlationId={correlationId} ACK JSON 無法解析: {BridgeDiagnosticFormatter.FormatException(ex)}，{retryDelay.TotalSeconds:0} 秒後重試。");
             return retryDelay;
         }
 
@@ -419,7 +427,8 @@ public sealed class BmsApiClient : IDisposable
         {
             _recoveryFailureCount++;
             TimeSpan retryDelay = CalculateRecoveryErrorDelay(_recoveryFailureCount);
-            OnLogReceived?.Invoke($"BMS 補償查詢 ACK rejected {TrimForLog(responseText)}，{retryDelay.TotalSeconds:0} 秒後重試。");
+            OnLogReceived?.Invoke(
+                $"BMS 補償查詢 correlationId={correlationId} ACK rejected {TrimForLog(responseText)}，{retryDelay.TotalSeconds:0} 秒後重試。");
             return retryDelay;
         }
 
@@ -479,7 +488,8 @@ public sealed class BmsApiClient : IDisposable
                         .ConfigureAwait(false);
                 }
 
-                OnLogReceived?.Invoke($"BMS recovery decision rejected: {error}");
+                OnLogReceived?.Invoke(
+                    $"BMS recovery decision rejected: eventId={candidate?.EventId}, eventUid={candidate?.EventUid}, generation={decision.Generation}, dispatchCount={decision.DispatchCount}, reason={error}");
                 continue;
             }
 
@@ -528,7 +538,7 @@ public sealed class BmsApiClient : IDisposable
                         DateTimeOffset.UtcNow)
                     .ConfigureAwait(false);
                 OnLogReceived?.Invoke(
-                    $"BMS terminal recovery decision rejected: command generation or dispatch does not match the latest local ledger for event {exactCandidate.EventId}.");
+                    $"BMS terminal recovery decision rejected: commandId={decision.CommandId}, eventId={exactCandidate.EventId}, eventUid={exactCandidate.EventUid}, generation={decision.Generation}, dispatchCount={decision.DispatchCount}; command generation or dispatch does not match the latest local ledger.");
                 continue;
             }
 
@@ -800,6 +810,7 @@ public sealed class BmsApiClient : IDisposable
             AuthenticatedPostResponse authenticated = await SendAuthenticatedPostAsync(
                     uri,
                     json,
+                    submission.CommandId,
                     cancellationToken)
                 .ConfigureAwait(false);
             using HttpResponseMessage response = authenticated.Response;
@@ -877,7 +888,9 @@ public sealed class BmsApiClient : IDisposable
         }
         catch (Exception ex)
         {
-            return RecoveryPostResult.Failed("RecoveryUnconfirmed", ex.Message);
+            return RecoveryPostResult.Failed(
+                "RecoveryUnconfirmed",
+                BridgeDiagnosticFormatter.FormatException(ex));
         }
     }
 
@@ -1069,7 +1082,8 @@ public sealed class BmsApiClient : IDisposable
         catch (JsonException ex)
         {
             gameResult = default;
-            error = $"Retained GameResult JSON is invalid: {ex.Message}";
+            error =
+                $"Retained GameResult JSON is invalid: {BridgeDiagnosticFormatter.FormatException(ex)}";
             return false;
         }
     }
@@ -1237,7 +1251,8 @@ public sealed class BmsApiClient : IDisposable
         }
 
         string status = result.Success ? "完成" : "未完成";
-        OnLogReceived?.Invoke($"BMS 命令 {command.Type}({command.CommandId}) {status}: {result.Message}");
+        OnLogReceived?.Invoke(
+            $"BMS 命令 {command.Type} commandId={command.CommandId}, eventId={command.EventId}, eventUid={command.EventUid}, generation={command.Generation}, dispatchCount={command.DispatchCount}, sourceDataCode={command.SourceDataCode}, deviceId={command.DeviceId}, shoe={command.Shoe}, round={command.Round} {status}: {result.Message}");
     }
 
     private Task<BridgeCommandHandlingResult> HandleCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
@@ -1262,6 +1277,7 @@ public sealed class BmsApiClient : IDisposable
             AuthenticatedPostResponse authenticated = await SendAuthenticatedPostAsync(
                     uri,
                     json,
+                    expectedEventUid,
                     cancellationToken)
                 .ConfigureAwait(false);
             using HttpResponseMessage response = authenticated.Response;
@@ -1298,7 +1314,9 @@ public sealed class BmsApiClient : IDisposable
         }
         catch (Exception ex)
         {
-            return BridgeSendResult.Unconfirmed(null, ex.Message);
+            return BridgeSendResult.Unconfirmed(
+                null,
+                BridgeDiagnosticFormatter.FormatException(ex));
         }
     }
 
@@ -1338,12 +1356,18 @@ public sealed class BmsApiClient : IDisposable
     private async Task<AuthenticatedPostResponse> SendAuthenticatedPostAsync(
         Uri uri,
         string json,
+        string correlationId,
         CancellationToken cancellationToken)
     {
         for (int attempt = 0; attempt < 2; attempt++)
         {
             using HttpRequestMessage request = new(HttpMethod.Post, uri);
             request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            request.Headers.TryAddWithoutValidation(
+                BridgeDiagnosticFormatter.CorrelationHeaderName,
+                BridgeDiagnosticFormatter.NormalizeCorrelationId(
+                    correlationId,
+                    $"angel-request-{Guid.NewGuid():N}"));
             string usedToken = await ApplyBearerTokenAsync(request, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -1427,7 +1451,7 @@ public sealed class BmsApiClient : IDisposable
 
     private static string BuildEventLabel(BridgePendingEvent pending)
     {
-        return $"#{pending.EventId} {pending.Type} {pending.SourceDataCode} {pending.Shoe}/{pending.Round}";
+        return $"#{pending.EventId} eventUid={pending.EventUid} {pending.Type} {pending.SourceDataCode} {pending.Shoe}/{pending.Round}";
     }
 
     private static TimeSpan ResolveNextRecoveryDelay(AngelBridgeHeartbeatResponse? response)
@@ -1536,8 +1560,7 @@ public sealed class BmsApiClient : IDisposable
             return string.Empty;
         }
 
-        string normalized = text.ReplaceLineEndings(" ").Trim();
-        return normalized.Length <= 160 ? normalized : normalized[..160] + "...";
+        return BridgeDiagnosticFormatter.SanitizeForLog(text, maxLength: 160);
     }
 }
 
@@ -1950,6 +1973,9 @@ public sealed class BmsClientCredentialsAccessTokenProvider : IBmsAccessTokenPro
             }
 
             using HttpRequestMessage request = new(HttpMethod.Post, _tokenEndpoint);
+            request.Headers.TryAddWithoutValidation(
+                BridgeDiagnosticFormatter.CorrelationHeaderName,
+                $"angel-token-{Guid.NewGuid():N}");
             string json = JsonSerializer.Serialize(
                 new BmsClientCredentialsTokenRequest(_clientId, _clientSecret),
                 TokenJsonOptions);

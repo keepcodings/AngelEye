@@ -28,8 +28,13 @@ public sealed class BmsEventAckIntegrationTests : IDisposable
         long eventId = await journal.AppendAsync(StartGamePayload());
         BridgePendingEvent pending = Assert.Single(
             await journal.GetDueOutboxEventsAsync(10, DateTime.UtcNow));
-        using BmsApiClient client = new(new DelegateHandler(_ =>
-            Task.FromResult(JsonResponse(new
+        string correlationId = string.Empty;
+        using BmsApiClient client = new(new DelegateHandler(request =>
+        {
+            correlationId = request.Headers
+                .GetValues(BridgeDiagnosticFormatter.CorrelationHeaderName)
+                .Single();
+            return Task.FromResult(JsonResponse(new
             {
                 errCode = 0,
                 data = new
@@ -39,7 +44,8 @@ public sealed class BmsEventAckIntegrationTests : IDisposable
                     eventId = eventId + 1,
                     eventUid = pending.EventUid
                 }
-            }))));
+            }));
+        }));
 
         int dispatched = await client.RunDispatchOnceAsync(
             new BmsApiSettings(
@@ -50,6 +56,7 @@ public sealed class BmsEventAckIntegrationTests : IDisposable
 
         Assert.Equal(1, dispatched);
         Assert.Equal("Unconfirmed", ReadStatus(eventId));
+        Assert.Equal(pending.EventUid, correlationId);
     }
 
     [Fact]

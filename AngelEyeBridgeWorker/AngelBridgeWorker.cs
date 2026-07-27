@@ -153,7 +153,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                Log("WARN", $"Background task stopped with error: {ex.Message}");
+                LogException(null, "WARN", "Background task stopped with error", ex);
             }
         }
 
@@ -165,7 +165,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                Log(endpoint, "WARN", $"Disconnect failed: {ex.Message}");
+                LogException(endpoint, "WARN", "Disconnect failed", ex);
             }
         }
 
@@ -233,7 +233,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                 endpoint.MarkAlignmentRequired(
                     $"Serialized endpoint event failed: {ex.GetType().Name}.");
                 TrySaveFailClosedState(endpoint);
-                Log(endpoint, "ERR", $"Serialized endpoint event failed: {ex.Message}");
+                LogException(endpoint, "ERR", "Serialized endpoint event failed", ex);
             }
         });
     }
@@ -285,7 +285,11 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Log(endpoint, "WARN", $"Connect failed {endpoint.ConnectionDisplay}: {ex.Message}");
+            LogException(
+                endpoint,
+                "WARN",
+                $"Connect failed {endpoint.ConnectionDisplay}",
+                ex);
         }
     }
 
@@ -389,7 +393,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             endpoint.MarkAlignmentRequired($"Card persistence failed: {ex.GetType().Name}.");
             TrySaveFailClosedState(endpoint);
-            Log(endpoint, "ERR", $"CardDrawn handling failed: {ex.Message}");
+            LogException(endpoint, "ERR", "CardDrawn handling failed", ex);
         }
     }
 
@@ -489,7 +493,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             endpoint.MarkAlignmentRequired($"GameResult persistence failed: {ex.GetType().Name}.");
             TrySaveFailClosedState(endpoint);
-            Log(endpoint, "ERR", $"GameResult handling failed: {ex.Message}");
+            LogException(endpoint, "ERR", "GameResult handling failed", ex);
         }
     }
 
@@ -511,7 +515,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             endpoint.MarkAlignmentRequired($"Cut-card persistence failed: {ex.GetType().Name}.");
             TrySaveFailClosedState(endpoint);
-            Log(endpoint, "ERR", $"CutCard handling failed: {ex.Message}");
+            LogException(endpoint, "ERR", "CutCard handling failed", ex);
         }
     }
 
@@ -536,7 +540,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             endpoint.MarkAlignmentRequired($"Error persistence failed: {ex.GetType().Name}.");
             TrySaveFailClosedState(endpoint);
-            Log(endpoint, "ERR", $"Error handling failed: {ex.Message}");
+            LogException(endpoint, "ERR", "Error handling failed", ex);
         }
     }
 
@@ -549,7 +553,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Log(endpoint, "ERR", $"LockStatus handling failed: {ex.Message}");
+            LogException(endpoint, "ERR", "LockStatus handling failed", ex);
         }
     }
 
@@ -566,7 +570,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Log(endpoint, "ERR", $"ErrorCleared handling failed: {ex.Message}");
+            LogException(endpoint, "ERR", "ErrorCleared handling failed", ex);
         }
     }
 
@@ -645,7 +649,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             {
                 endpoint.MarkAlignmentRequired($"Derived boundary failed: {ex.GetType().Name}.");
                 TrySaveFailClosedState(endpoint);
-                Log(endpoint, "ERR", $"Next round schedule failed: {ex.Message}");
+                LogException(endpoint, "ERR", "Next round schedule failed", ex);
             }
             finally
             {
@@ -831,7 +835,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                 CancelPendingNextRound(endpoint);
                 endpoint.MarkAlignmentRequired($"Raw frame persistence failed: {ex.GetType().Name}.");
                 TrySaveFailClosedState(endpoint);
-                Log(endpoint, "ERR", $"Raw frame persistence failed: {ex.Message}");
+                LogException(endpoint, "ERR", "Raw frame persistence failed", ex);
             });
             return false;
         }
@@ -845,7 +849,11 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
         catch (Exception stateException)
         {
-            Log(endpoint, "ERR", $"Fail-closed state persistence failed: {stateException.Message}");
+            LogException(
+                endpoint,
+                "ERR",
+                "Fail-closed state persistence failed",
+                stateException);
         }
     }
 
@@ -900,7 +908,13 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
         long eventId = await _journal.AppendAsync(payload, queueForDelivery).ConfigureAwait(false);
         string disposition = queueForDelivery ? "Outbox queued" : "Local stored";
-        Log(endpoint, "API", $"{disposition} #{eventId} {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
+        string eventUid = payload.TryGetValue("eventUid", out object? eventUidValue)
+            ? eventUidValue?.ToString() ?? string.Empty
+            : string.Empty;
+        Log(
+            endpoint,
+            "API",
+            $"{disposition} #{eventId} eventUid={eventUid} {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
         _ = RefreshOutboxStatusesAsync();
         return queueForDelivery;
     }
@@ -1053,7 +1067,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                Log(endpoint, "WARN", $"Outbox status failed: {ex.Message}");
+                LogException(endpoint, "WARN", "Outbox status failed", ex);
             }
         }
     }
@@ -1197,7 +1211,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Log("ERR", $"Query request failed: {ex.Message}");
+            LogException(null, "ERR", "Query request failed", ex);
             response = new WorkerHttpResponse(
                 500,
                 "Internal Server Error",
@@ -1316,5 +1330,17 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private void Log(string type, string message)
     {
         Log(null, type, message);
+    }
+
+    private void LogException(
+        ShoeEndpoint? endpoint,
+        string type,
+        string context,
+        Exception exception)
+    {
+        Log(
+            endpoint,
+            type,
+            $"{context}: {BridgeDiagnosticFormatter.FormatException(exception)}");
     }
 }
