@@ -28,6 +28,7 @@ public class SerialListener
         _decoder.LockStatusChanged += value => OnLockStatusChanged?.Invoke(value);
         _decoder.ErrorCleared += (code, message) => OnErrorCleared?.Invoke(code, message);
         _decoder.StatusChanged += value => OnStatusChanged?.Invoke(value);
+        _decoder.ProtocolSignalObserved += value => OnProtocolSignalObserved?.Invoke(value);
         _decoder.Diagnostic += (kind, message) => OnRawDataLogged?.Invoke(kind, message);
         _decoder.CommandAcknowledged += CompletePendingCommand;
     }
@@ -47,8 +48,21 @@ public class SerialListener
     /// <summary>Raised when the listener status changes.</summary>
     public event Action<string>? OnStatusChanged;
 
+    /// <summary>Raised for typed S/P protocol observations.</summary>
+    public event Action<ProtocolSignal>? OnProtocolSignalObserved;
+
+    /// <summary>Raised for typed transport lifecycle changes.</summary>
+    public event Action<TransportState>? OnTransportStateChanged;
+
     /// <summary>Raised for RX, RXRAW, TX, SIM, and SYS diagnostic log output.</summary>
     public event Action<string, string>? OnRawDataLogged; // Type (RX/RXRAW/TX/SYS), Hex/Message
+
+    /// <summary>
+    /// Optional fail-closed admission hook invoked before a receive chunk is exposed
+    /// to diagnostics or decoded. Returning false prevents all translated callbacks.
+    /// The headless Worker uses this to durably store raw transport evidence first.
+    /// </summary>
+    public Func<ReadOnlyMemory<byte>, bool>? RawFrameAdmission { get; set; }
 
     /// <summary>Raised when a pending command receives ACK, NAK, timeout, or port-closed completion.</summary>
     public event Action<SerialCommandResult>? OnCommandAcknowledged;
@@ -69,6 +83,33 @@ public class SerialListener
     /// <param name="NakCode">NAK error code when the shoe rejected the command.</param>
     /// <param name="Message">Human-readable command result.</param>
     public readonly record struct SerialCommandResult(bool Succeeded, int? NakCode, string Message);
+
+    /// <summary>Protocol signals that are diagnostic-only until QA validates a boundary.</summary>
+    public enum ProtocolSignalKind
+    {
+        StartOfCommunication,
+        StandBy
+    }
+
+    /// <summary>Typed, immutable S/P protocol observation.</summary>
+    public readonly record struct ProtocolSignal(
+        ProtocolSignalKind Kind,
+        string Sequence,
+        string RawBytes);
+
+    /// <summary>Transport lifecycle states kept separate from round lifecycle state.</summary>
+    public enum TransportStateKind
+    {
+        Connected,
+        LocalClosed,
+        RemoteClosed,
+        ReadError
+    }
+
+    /// <summary>Typed, immutable transport lifecycle observation.</summary>
+    public readonly record struct TransportState(
+        TransportStateKind Kind,
+        string Message);
 
     /// <summary>
     /// Parsed card draw or non-game card-state event.
@@ -174,6 +215,9 @@ public class SerialListener
         _serialPort.DataReceived += SerialPort_DataReceived;
         _serialPort.Open();
 
+        OnTransportStateChanged?.Invoke(new TransportState(
+            TransportStateKind.Connected,
+            $"Serial {portName} connected."));
         OnStatusChanged?.Invoke($"串口 {portName} 已成功開啟。");
         OnRawDataLogged?.Invoke("SYS", $"Connected to {portName}");
     }
@@ -205,6 +249,9 @@ public class SerialListener
         _tcpReadCts = new CancellationTokenSource();
         _tcpReadTask = Task.Run(() => TcpReadLoopAsync(host, port, _tcpReadCts.Token));
 
+        OnTransportStateChanged?.Invoke(new TransportState(
+            TransportStateKind.Connected,
+            $"MOXA TCP {host}:{port} connected."));
         OnStatusChanged?.Invoke($"MOXA TCP {host}:{port} 已成功連線。");
         OnRawDataLogged?.Invoke("SYS", $"Connected to MOXA TCP {host}:{port}");
     }
@@ -214,6 +261,7 @@ public class SerialListener
     /// </summary>
     public void Close()
     {
+        bool wasOpen = IsOpen;
         _tcpReadCts?.Cancel();
         _tcpStream?.Dispose();
         _tcpStream = null;
@@ -236,6 +284,12 @@ public class SerialListener
         CompletePendingCommand(new SerialCommandResult(false, null, "Serial port closed"));
         _decoder.Reset();
         IsMockMode = false;
+        if (wasOpen)
+        {
+            OnTransportStateChanged?.Invoke(new TransportState(
+                TransportStateKind.LocalClosed,
+                "Connection closed locally."));
+        }
         OnStatusChanged?.Invoke("連線已關閉。");
     }
 
@@ -254,11 +308,13 @@ public class SerialListener
             byte[] bytes = new byte[bytesToRead];
             _serialPort.Read(bytes, 0, bytesToRead);
 
-            LogRawBytes(bytes);
             InjectBytes(bytes);
         }
         catch (Exception ex)
         {
+            OnTransportStateChanged?.Invoke(new TransportState(
+                TransportStateKind.ReadError,
+                $"Serial read failed: {ex.GetType().Name}."));
             OnRawDataLogged?.Invoke("SYS", $"Error reading serial data: {ex.Message}");
         }
     }
@@ -273,6 +329,9 @@ public class SerialListener
                 int bytesRead = await _tcpStream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
                 if (bytesRead <= 0)
                 {
+                    OnTransportStateChanged?.Invoke(new TransportState(
+                        TransportStateKind.RemoteClosed,
+                        $"MOXA TCP {host}:{port} closed by remote."));
                     OnRawDataLogged?.Invoke("SYS", $"MOXA TCP {host}:{port} connection closed by remote.");
                     OnStatusChanged?.Invoke($"MOXA TCP {host}:{port} 已斷線。");
                     break;
@@ -280,7 +339,6 @@ public class SerialListener
 
                 byte[] bytes = new byte[bytesRead];
                 Array.Copy(buffer, bytes, bytesRead);
-                LogRawBytes(bytes);
                 InjectBytes(bytes);
             }
         }
@@ -296,6 +354,9 @@ public class SerialListener
         {
             if (!cancellationToken.IsCancellationRequested)
             {
+                OnTransportStateChanged?.Invoke(new TransportState(
+                    TransportStateKind.ReadError,
+                    $"MOXA TCP {host}:{port} read failed: {ex.GetType().Name}."));
                 OnRawDataLogged?.Invoke("SYS", $"Error reading MOXA TCP data: {ex.Message}");
                 OnStatusChanged?.Invoke($"MOXA TCP 讀取錯誤: {ex.Message}");
             }
@@ -308,6 +369,32 @@ public class SerialListener
     /// <param name="bytes">Raw bytes to parse.</param>
     public void InjectBytes(byte[] bytes)
     {
+        ArgumentNullException.ThrowIfNull(bytes);
+        if (bytes.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (RawFrameAdmission is not null &&
+                !RawFrameAdmission(bytes))
+            {
+                OnRawDataLogged?.Invoke(
+                    "SYS",
+                    "Raw receive chunk was rejected before decode because durable admission failed.");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            OnRawDataLogged?.Invoke(
+                "SYS",
+                $"Raw receive chunk was rejected before decode: {ex.GetType().Name}.");
+            return;
+        }
+
+        LogRawBytes(bytes);
         _decoder.Feed(bytes);
     }
 

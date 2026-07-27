@@ -11,6 +11,7 @@ namespace AngelEyeBmsBridge;
 public partial class Form1 : Form
 {
     private readonly BmsApiClient _bmsApiClient = new();
+    private BmsClientCredentialsAccessTokenProvider? _bmsAccessTokenProvider;
     private readonly ToolTip _fieldToolTip = new()
     {
         AutoPopDelay = 8000,
@@ -23,14 +24,11 @@ public partial class Form1 : Form
     private readonly Random _random = new();
     private readonly System.Windows.Forms.Timer _autoRunTimer = new();
     private readonly System.Windows.Forms.Timer _outboxStatusTimer = new();
-    private readonly System.Windows.Forms.Timer _nextRoundCountdownTimer = new();
     private BridgeEventJournal? _eventJournal;
     private long _eventSequence;
     private readonly Dictionary<ShoeEndpoint, BaccaratAutoRunSession> _autoRunSessions = [];
     private readonly Dictionary<ShoeEndpoint, BridgeOutboxStatus> _outboxStatuses = [];
-    private readonly Dictionary<ShoeEndpoint, PendingNextRoundCountdown> _pendingNextRoundCountdowns = [];
     private readonly HashSet<string> _handledBmsCommandIds = [];
-    private readonly RecoverRoundBackoffTracker _recoverRoundBackoff = new();
     private bool _autoRunTickInProgress;
     private bool _outboxStatusRefreshInProgress;
 
@@ -169,8 +167,6 @@ public partial class Form1 : Form
 
     private sealed record DuplicateEndpointField(string Label, string Value, ShoeEndpoint Endpoint);
 
-    private sealed record PendingNextRoundCountdown(long SettledShoe, long SettledRound, DateTimeOffset DueAtUtc);
-
     private readonly record struct ResultHoldCountdown(bool Active, int TotalMilliseconds, int RemainingMilliseconds);
 
     private ShoeEndpoint? SelectedEndpoint
@@ -206,8 +202,6 @@ public partial class Form1 : Form
         _outboxStatusTimer.Interval = 2000;
         _outboxStatusTimer.Tick += OutboxStatusTimer_Tick;
         _outboxStatusTimer.Start();
-        _nextRoundCountdownTimer.Interval = 250;
-        _nextRoundCountdownTimer.Tick += NextRoundCountdownTimer_Tick;
         RegisterBmsEvents();
         _ = EnsureBmsDispatcherStartedAsync(showErrors: false);
         _ = RefreshOutboxStatusesAsync();
@@ -353,7 +347,7 @@ public partial class Form1 : Form
         Label tokenTitle = new()
         {
             Dock = DockStyle.Fill,
-            Text = "Token",
+            Text = "BMS 認證",
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.FromArgb(25, 42, 56),
             Font = new Font("Microsoft JhengHei", 10F, FontStyle.Bold)
@@ -445,9 +439,9 @@ public partial class Form1 : Form
         };
 
         txtBmsUrl = new TextBox { Text = _settings.BmsUrl, Dock = DockStyle.Fill, ReadOnly = true };
-        txtBmsToken = new TextBox { Text = _settings.BmsToken, Dock = DockStyle.Fill, UseSystemPasswordChar = true, ReadOnly = true };
-        btnJwtSettings = new Button { Text = "JWT設定", Width = 88, Height = 28, Anchor = AnchorStyles.Left };
-        btnCopyToken = new Button { Text = "複製", Width = 76, Height = 28, Anchor = AnchorStyles.Left };
+        txtBmsToken = new TextBox { Dock = DockStyle.Fill, ReadOnly = true };
+        btnJwtSettings = new Button { Text = "認證設定", Width = 88, Height = 28, Anchor = AnchorStyles.Left };
+        btnCopyToken = new Button { Text = "不顯示", Width = 76, Height = 28, Anchor = AnchorStyles.Left, Enabled = false };
         btnConnectionModeSettings = new Button { Text = "設定", Width = 70, Height = 28, Anchor = AnchorStyles.Left };
         btnApiEdit = new Button { Text = "編輯", Width = 68, Height = 28, Anchor = AnchorStyles.Left };
         btnApiApply = new Button { Text = "套用", Width = 68, Height = 28, Anchor = AnchorStyles.Left };
@@ -2244,13 +2238,6 @@ public partial class Form1 : Form
     private async void Endpoint_CardDrawn(ShoeEndpoint endpoint, SerialListener.CardInfo card)
     {
         _settings.Save();
-        // 'R' Retransmission 是下一局的牌，不代表新局開始，不觸發 StartGame
-        if (card.EventCode != 'R' && card.Target == "Player" && card.Index == 1)
-        {
-            CancelPendingNextRoundCountdown(endpoint);
-            await PublishStartGameIfNeededAsync(endpoint);
-        }
-
         AppendLog(endpoint, "EVENT", $"CardDrawn {endpoint.CurrentShoe}/{endpoint.CurrentRound} {card.Target} #{card.Index} {card.Suit} {card.Value}");
         if (!IsBaccaratCardForBms(card))
         {
@@ -2275,20 +2262,56 @@ public partial class Form1 : Form
     private async void Endpoint_GameResultReceived(ShoeEndpoint endpoint, SerialListener.GameResult result)
     {
         _settings.Save();
+        DateTimeOffset sourceTimestamp = DateTimeOffset.UtcNow;
+        bool hasDeliverableStartGame = _eventJournal != null &&
+            await _eventJournal.HasDeliverableStartGameAsync(
+                endpoint.SourceDataCode,
+                endpoint.DeviceId,
+                endpoint.CurrentShoe,
+                endpoint.CurrentRound,
+                endpoint.CurrentRoundId);
+        bool isDeliverableResult = IsDeliverableGameResult(result.Result);
+        string p1 = ToBmsCard(endpoint.PlayerCards, 1);
+        string p2 = ToBmsCard(endpoint.PlayerCards, 2);
+        string p3 = ToBmsCard(endpoint.PlayerCards, 3);
+        string b1 = ToBmsCard(endpoint.BankerCards, 1);
+        string b2 = ToBmsCard(endpoint.BankerCards, 2);
+        string b3 = ToBmsCard(endpoint.BankerCards, 3);
+        bool hasMandatoryCards = HasMandatoryBaccaratCards(p1, p2, b1, b2);
         AppendLog(endpoint, "EVENT", $"GameResult {endpoint.CurrentShoe}/{endpoint.CurrentRound} {result.Result} / {result.Pair}");
         await PublishBridgeEventAsync("GameResult", endpoint, new
         {
             result = result.Result,
-            pair = result.Pair
-        });
-        ScheduleNextRoundCountdownAfterResult(endpoint);
+            pair = result.Pair,
+            status = string.Equals(result.Result, "ForceQuit", StringComparison.OrdinalIgnoreCase)
+                ? "Cancel"
+                : "Normal",
+            sourceTimestamp = sourceTimestamp.ToString("o", CultureInfo.InvariantCulture),
+            cards = new
+            {
+                p1,
+                p2,
+                p3,
+                b1,
+                b2,
+                b3
+            }
+        }, allowBmsDelivery: hasDeliverableStartGame && isDeliverableResult && hasMandatoryCards);
+        if (!hasDeliverableStartGame || !isDeliverableResult || !hasMandatoryCards)
+        {
+            string reason = !hasDeliverableStartGame
+                ? "無已登記 StartGame"
+                : !isDeliverableResult
+                    ? $"結果 {result.Result} 不可作正常賽果"
+                    : "缺少必要牌 p1/p2/b1/b2";
+            AppendLog(endpoint, "API", $"GameResult {endpoint.CurrentShoe}/{endpoint.CurrentRound} {reason}，僅保留本機。");
+        }
     }
 
     private async void Endpoint_CuttingCardDrawn(ShoeEndpoint endpoint, SerialListener.CutCardInfo cutCard)
     {
         _settings.Save();
         AppendLog(endpoint, "EVENT", $"CutCardDrawn {endpoint.CurrentShoe}/{endpoint.CurrentRound} - Shoe ending");
-        CancelPendingNextRoundCountdown(endpoint);
         StopAutoRun(endpoint);
 
         await PublishBridgeEventAsync("CutCardDrawn", endpoint, new
@@ -2300,7 +2323,6 @@ public partial class Form1 : Form
 
     private async void Endpoint_ErrorOccurred(ShoeEndpoint endpoint, SerialListener.ErrorInfo error)
     {
-        CancelPendingNextRoundCountdown(endpoint);
         AppendLog(endpoint, "EVENT", $"Error [{error.ErrorCode}] {error.ErrorMessage}");
         await PublishBridgeEventAsync("Error", endpoint, new
         {
@@ -2327,94 +2349,6 @@ public partial class Form1 : Form
             errorCode,
             errorMessage
         });
-    }
-
-    private void ScheduleNextRoundCountdownAfterResult(ShoeEndpoint endpoint)
-    {
-        if (InvokeRequired)
-        {
-            BeginInvoke(new Action(() => ScheduleNextRoundCountdownAfterResult(endpoint)));
-            return;
-        }
-
-        if (_autoRunSessions.ContainsKey(endpoint) || endpoint.ShoeEnding)
-        {
-            return;
-        }
-
-        _pendingNextRoundCountdowns[endpoint] = new PendingNextRoundCountdown(
-            endpoint.CurrentShoe,
-            endpoint.CurrentRound,
-            DateTimeOffset.UtcNow.AddSeconds(ResultToNextRoundDelaySeconds));
-
-        if (!_nextRoundCountdownTimer.Enabled)
-        {
-            _nextRoundCountdownTimer.Start();
-        }
-
-        AppendLog(endpoint, "SYS", $"結算後 {ResultToNextRoundDelaySeconds} 秒自動進入下一局倒數。");
-    }
-
-    private void CancelPendingNextRoundCountdown(ShoeEndpoint? endpoint = null)
-    {
-        if (InvokeRequired)
-        {
-            BeginInvoke(new Action(() => CancelPendingNextRoundCountdown(endpoint)));
-            return;
-        }
-
-        if (endpoint == null)
-        {
-            _pendingNextRoundCountdowns.Clear();
-        }
-        else
-        {
-            _pendingNextRoundCountdowns.Remove(endpoint);
-        }
-
-        if (_pendingNextRoundCountdowns.Count == 0)
-        {
-            _nextRoundCountdownTimer.Stop();
-        }
-    }
-
-    private async void NextRoundCountdownTimer_Tick(object? sender, EventArgs e)
-    {
-        DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
-        foreach ((ShoeEndpoint endpoint, PendingNextRoundCountdown pending) in _pendingNextRoundCountdowns.ToList())
-        {
-            if (nowUtc < pending.DueAtUtc)
-            {
-                if (ReferenceEquals(endpoint, SelectedEndpoint))
-                {
-                    RefreshSelectedEndpointView(endpoint);
-                }
-                continue;
-            }
-
-            _pendingNextRoundCountdowns.Remove(endpoint);
-
-            if (!_endpoints.Contains(endpoint) ||
-                endpoint.CurrentShoe != pending.SettledShoe ||
-                endpoint.CurrentRound != pending.SettledRound ||
-                endpoint.InErrorMode ||
-                endpoint.ShoeEnding)
-            {
-                continue;
-            }
-
-            if (!endpoint.IsConnected)
-            {
-                continue;
-            }
-
-            await BeginNextRoundCountdownAsync(endpoint, nowUtc, "結算後自動下一局");
-        }
-
-        if (_pendingNextRoundCountdowns.Count == 0)
-        {
-            _nextRoundCountdownTimer.Stop();
-        }
     }
 
     private async Task BeginNextRoundCountdownAsync(ShoeEndpoint endpoint, DateTimeOffset startedAtUtc, string reason)
@@ -2451,7 +2385,7 @@ public partial class Form1 : Form
         {
             rootFields["totalBetTime"] = totalBetTime;
             rootFields["startTime"] = startTime.ToString("o");
-        });
+        }, allowBmsDelivery: true);
 
         if (queued)
         {
@@ -2471,16 +2405,22 @@ public partial class Form1 : Form
         return Math.Clamp(seconds, 5, 120);
     }
 
-    private async Task<bool> PublishBridgeEventAsync(string type, ShoeEndpoint endpoint, object data, Action<Dictionary<string, object?>>? configureRoot = null)
+    private async Task<bool> PublishBridgeEventAsync(
+        string type,
+        ShoeEndpoint endpoint,
+        object data,
+        Action<Dictionary<string, object?>>? configureRoot = null,
+        bool allowBmsDelivery = false)
     {
-        if (!endpoint.BmsTransmitEnabled)
-        {
-            AppendLog(endpoint, "API", $"BMS 傳送已關閉，略過 {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
-            return false;
-        }
+        bool queueForDelivery =
+            allowBmsDelivery &&
+            type is "StartGame" or "GameResult" &&
+            endpoint.Enabled &&
+            endpoint.BmsTransmitEnabled;
 
         Dictionary<string, object?> payload = new()
         {
+            ["bridgeId"] = _settings.BridgeId,
             ["type"] = type,
             ["source"] = AngelEyeProtocol.SourceName,
             ["sequence"] = Interlocked.Increment(ref _eventSequence),
@@ -2523,10 +2463,11 @@ public partial class Form1 : Form
 
         try
         {
-            long eventId = await _eventJournal.AppendAsync(payload);
-            AppendLog(endpoint, "API", $"Outbox queued #{eventId} {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
+            long eventId = await _eventJournal.AppendAsync(payload, queueForDelivery);
+            string disposition = queueForDelivery ? "Outbox queued" : "Local stored";
+            AppendLog(endpoint, "API", $"{disposition} #{eventId} {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
             _ = RefreshOutboxStatusesAsync();
-            return true;
+            return queueForDelivery;
         }
         catch (Exception ex)
         {
@@ -2951,12 +2892,6 @@ public partial class Form1 : Form
         int totalMilliseconds = ResultToNextRoundDelaySeconds * 1000;
         DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
 
-        if (_pendingNextRoundCountdowns.TryGetValue(endpoint, out PendingNextRoundCountdown? pending))
-        {
-            int remainingMilliseconds = Math.Clamp((int)Math.Ceiling((pending.DueAtUtc - nowUtc).TotalMilliseconds), 0, totalMilliseconds);
-            return new ResultHoldCountdown(remainingMilliseconds > 0, totalMilliseconds, remainingMilliseconds);
-        }
-
         if (_autoRunSessions.TryGetValue(endpoint, out BaccaratAutoRunSession? session) &&
             session.State == BaccaratAutoRunState.ResultHold &&
             session.ResultStartedAtUtc.HasValue)
@@ -3346,7 +3281,6 @@ public partial class Form1 : Form
             return;
         }
         StopAutoRun(endpoint);
-        CancelPendingNextRoundCountdown(endpoint);
 
         endpoint.Disconnect();
         _endpoints.Remove(endpoint);
@@ -3466,7 +3400,6 @@ public partial class Form1 : Form
         }
 
         StopAutoRun(endpoint);
-        CancelPendingNextRoundCountdown(endpoint);
 
         endpoint.Disconnect();
         AppendLog(endpoint, "SYS", "牌盒已斷線。");
@@ -3480,7 +3413,6 @@ public partial class Form1 : Form
             return;
         }
         StopAutoRun(endpoint);
-        CancelPendingNextRoundCountdown(endpoint);
 
         if (endpoint.IsConnected && endpoint.IsLocked == true)
         {
@@ -3493,25 +3425,68 @@ public partial class Form1 : Form
             return;
         }
 
-        endpoint.StartNewShoe();
+        string actionId = $"gui-{Guid.NewGuid():N}";
+        endpoint.ConfirmNewShoe(
+            actionId,
+            "Engineering GUI operator confirmed physical shoe replacement.");
         long newShoe = endpoint.CurrentShoe;
-        AppendLog(endpoint, "SYS", $"已切換新靴: {newShoe}");
-
-        if (endpoint.IsConnected && !endpoint.InErrorMode)
-        {
-            await BeginNextRoundCountdownAsync(endpoint, DateTimeOffset.UtcNow, "新靴第一局倒數");
-        }
-        else
-        {
-            _settings.Save();
-            RefreshEndpointGridRow(endpoint);
-            RefreshSelectedEndpointView(endpoint);
-            AppendLog(endpoint, "SYS", "牌盒未連線或仍在錯誤模式，新靴第一局倒數未啟動。");
-        }
+        _settings.Save();
+        RefreshEndpointGridRow(endpoint);
+        RefreshSelectedEndpointView(endpoint);
+        AppendLog(
+            endpoint,
+            "SYS",
+            $"已切換新靴: {newShoe}；actionId={actionId}；等待可信開局邊界，不自動建立 StartGame。");
 
         txtCurrentShoe!.Text = endpoint.CurrentShoe.ToString(CultureInfo.InvariantCulture);
         txtCurrentRound!.Text = endpoint.CurrentRound.ToString(CultureInfo.InvariantCulture);
+        await Task.CompletedTask;
     }
+
+    private static string ToBmsCard(IEnumerable<BaccaratCard> cards, int index)
+    {
+        BaccaratCard? card = cards.FirstOrDefault(candidate => candidate.Index == index);
+        if (card is null)
+        {
+            return string.Empty;
+        }
+
+        string rank = card.Value.Trim().ToUpperInvariant() switch
+        {
+            "1" => "A",
+            "11" => "J",
+            "12" => "Q",
+            "13" => "K",
+            string value => value
+        };
+        string suit = card.Suit.Trim() switch
+        {
+            "Spade" or "Spades" or "s" or "S" => "s",
+            "Heart" or "Hearts" or "h" or "H" => "h",
+            "Diamond" or "Diamonds" or "d" or "D" => "d",
+            "Club" or "Clubs" or "c" or "C" => "c",
+            _ => string.Empty
+        };
+
+        return string.IsNullOrWhiteSpace(rank) || string.IsNullOrWhiteSpace(suit)
+            ? string.Empty
+            : $"{rank}{suit}";
+    }
+
+    private static bool IsDeliverableGameResult(string result) =>
+        string.Equals(result, "PlayerWin", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(result, "BankerWin", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(result, "Tie", StringComparison.OrdinalIgnoreCase);
+
+    internal static bool HasMandatoryBaccaratCards(
+        string p1,
+        string p2,
+        string b1,
+        string b2) =>
+        !string.IsNullOrWhiteSpace(p1) &&
+        !string.IsNullOrWhiteSpace(p2) &&
+        !string.IsNullOrWhiteSpace(b1) &&
+        !string.IsNullOrWhiteSpace(b2);
 
     private async Task SendSelectedLockAsync(bool locked)
     {
@@ -3606,7 +3581,6 @@ public partial class Form1 : Form
             return;
         }
         StopAutoRun(endpoint);
-        CancelPendingNextRoundCountdown(endpoint);
 
         endpoint.ResetMockTestState();
         RefreshEndpointGridRow(endpoint);
@@ -3874,7 +3848,6 @@ public partial class Form1 : Form
             return;
         }
 
-        CancelPendingNextRoundCountdown(endpoint);
         int cutAfterRounds = GetAutoCutAfterRounds();
         _autoRunSessions[endpoint] = new BaccaratAutoRunSession
         {
@@ -4242,51 +4215,40 @@ public partial class Form1 : Form
 
     private bool TryRefreshGeneratedToken(bool showError)
     {
-        if (string.IsNullOrWhiteSpace(_settings.JwtSigningKey))
+        bool ready =
+            !string.IsNullOrWhiteSpace(_settings.BridgeId) &&
+            !IsMissingBmsCredential(_settings.BmsClientId) &&
+            !IsMissingBmsCredential(_settings.BmsClientSecret);
+
+        // Tokens are obtained on demand by the dispatcher, cached only in memory,
+        // and never copied into settings or displayed by the engineering GUI.
+        _settings.BmsToken = string.Empty;
+        _settings.JwtSigningKey = string.Empty;
+        if (txtBmsToken != null)
         {
-            _settings.BmsToken = string.Empty;
-            if (txtBmsToken != null)
-            {
-                txtBmsToken.UseSystemPasswordChar = false;
-                txtBmsToken.Text = "未配置 JWT Signing Key";
-            }
-
-            if (showError)
-            {
-                MessageBox.Show("JWT Signing Key 尚未配置。請由部署人員按「JWT設定」填入 BMS SourceProvider token 參數。", "Token 設定不足", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-
-            return false;
+            txtBmsToken.UseSystemPasswordChar = false;
+            txtBmsToken.Text = ready
+                ? "短效 Token：每次請求自動取得及刷新（不顯示）"
+                : "尚未設定 Bridge ID / Client ID / Client Secret";
         }
 
-        try
+        if (!ready && showError)
         {
-            string token = JwtTokenGenerator.GenerateSourceProviderToken(
-                _settings.JwtNameIdentifier,
-                _settings.JwtSerialNumber,
-                _settings.JwtIssuer,
-                _settings.JwtAudience,
-                _settings.JwtSigningKey,
-                _settings.JwtLifetimeMinutes);
-            _settings.BmsToken = token;
-            if (txtBmsToken != null)
-            {
-                txtBmsToken.UseSystemPasswordChar = true;
-                txtBmsToken.Text = token;
-            }
-
-            return true;
+            MessageBox.Show(
+                "請先設定 BMS 核發的 Bridge ID、Client ID 與 Client Secret。" +
+                "GUI 不會保存 access token，也不會使用共用 JWT Signing Key。",
+                "BMS 認證尚未配置",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
         }
-        catch (Exception ex)
-        {
-            if (showError)
-            {
-                MessageBox.Show(ex.Message, "Token 設定錯誤", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
 
-            return false;
-        }
+        return ready;
     }
+
+    private static bool IsMissingBmsCredential(string? value) =>
+        string.IsNullOrWhiteSpace(value) ||
+        value.Contains("REPLACE", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("PLACEHOLDER", StringComparison.OrdinalIgnoreCase);
 
     private async void BtnJwtSettings_Click(object? sender, EventArgs e)
     {
@@ -4295,6 +4257,7 @@ public partial class Form1 : Form
         {
             await _bmsApiClient.StopAsync();
         }
+        DisposeBmsAccessTokenProvider();
 
         using JwtSettingsDialog dialog = new(_settings);
         if (dialog.ShowDialog(this) != DialogResult.OK)
@@ -4307,23 +4270,28 @@ public partial class Form1 : Form
             return;
         }
 
-        TryRefreshGeneratedToken(showError: true);
+        bool tokenProviderReady = TryRefreshGeneratedToken(showError: true);
         _settings.Save();
         UpdateApiUiState();
-        AppendLog(null, "SYS", "JWT 設定已儲存並重新產生 Token。");
-        await EnsureBmsDispatcherStartedAsync(showErrors: false);
+        AppendLog(
+            null,
+            "SYS",
+            tokenProviderReady
+                ? "BMS client-credentials 設定已儲存；短效 Token 將在請求時取得。"
+                : "BMS client-credentials 尚未完成；dispatcher 保持停止。");
+        if (tokenProviderReady)
+        {
+            await EnsureBmsDispatcherStartedAsync(showErrors: false);
+        }
     }
 
     private void BtnCopyToken_Click(object? sender, EventArgs e)
     {
-        if (string.IsNullOrWhiteSpace(_settings.BmsToken))
-        {
-            MessageBox.Show("目前尚未產生 Token。請先確認 SQLite 設定已配置訊源商 JWT Signing Key。", "Token 尚未產生", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-
-        Clipboard.SetText(_settings.BmsToken);
-        AppendLog(null, "SYS", "Token 已複製到剪貼簿。");
+        MessageBox.Show(
+            "安全政策不允許 GUI 顯示或複製 access token。Token 只保存在程式記憶體並會自動刷新。",
+            "Token 不顯示",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
     }
 
     private void BtnConnectionModeSettings_Click(object? sender, EventArgs e)
@@ -4407,6 +4375,7 @@ public partial class Form1 : Form
         {
             await _bmsApiClient.StopAsync();
         }
+        DisposeBmsAccessTokenProvider();
 
         await EnsureBmsDispatcherStartedAsync(showErrors);
     }
@@ -4443,16 +4412,28 @@ public partial class Form1 : Form
         {
             _settings.BmsUrl = url;
             _settings.Save();
-            BmsApiSettings apiSettings = new(_settings.BmsUrl, _settings.BmsToken);
+            BmsApiSettings apiSettings = new(
+                _settings.BmsUrl,
+                string.Empty,
+                _settings.BridgeId,
+                "AngelEye Engineering GUI");
+            BmsClientCredentialsAccessTokenProvider accessTokenProvider = new(
+                _settings.BmsUrl,
+                _settings.BmsClientId,
+                _settings.BmsClientSecret,
+                _settings.BridgeId);
+            _bmsAccessTokenProvider = accessTokenProvider;
             _bmsApiClient.Start(
                 apiSettings,
                 _eventJournal,
                 IsEventDispatchEnabled,
                 BuildHeartbeatSnapshot,
-                HandleBmsCommandAsync);
+                HandleBmsCommandAsync,
+                accessTokenProvider: accessTokenProvider);
         }
         catch (Exception ex)
         {
+            DisposeBmsAccessTokenProvider();
             if (showErrors)
             {
                 MessageBox.Show($"事件 API 設定失敗：{ex.Message}", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -4466,6 +4447,12 @@ public partial class Form1 : Form
         }
 
         return Task.CompletedTask;
+    }
+
+    private void DisposeBmsAccessTokenProvider()
+    {
+        _bmsAccessTokenProvider?.Dispose();
+        _bmsAccessTokenProvider = null;
     }
 
     private IReadOnlyList<AngelBridgeHeartbeatEndpointStatus> BuildHeartbeatSnapshot()
@@ -4498,27 +4485,29 @@ public partial class Form1 : Form
         }).ToList();
     }
 
-    private async Task<BridgeCommandHandlingResult> HandleBmsCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
+    private Task<BridgeCommandHandlingResult> HandleBmsCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (_eventJournal == null)
         {
-            return BridgeCommandHandlingResult.Rejected("SQLite event journal is not available.");
+            return Task.FromResult(
+                BridgeCommandHandlingResult.Rejected("SQLite event journal is not available."));
         }
 
         if (!string.IsNullOrWhiteSpace(command.CommandId))
         {
             if (_handledBmsCommandIds.Contains(command.CommandId))
             {
-                return BridgeCommandHandlingResult.Handled("Command was already handled in this bridge session.");
+                return Task.FromResult(
+                    BridgeCommandHandlingResult.Handled("Command was already handled in this bridge session."));
             }
         }
 
         string type = command.Type.Trim();
         BridgeCommandHandlingResult result = type switch
         {
-            "RecoverRound" => await HandleRecoverRoundCommandAsync(command, cancellationToken).ConfigureAwait(false),
-            "ResendEvent" => await HandleResendEventCommandAsync(command, cancellationToken).ConfigureAwait(false),
+            "RecoverRound" or "ResendEvent" => BridgeCommandHandlingResult.Rejected(
+                "Legacy live /events replay is disabled; use the dedicated recovery workflow."),
             _ => BridgeCommandHandlingResult.Rejected($"Unsupported command type: {command.Type}")
         };
 
@@ -4527,134 +4516,7 @@ public partial class Form1 : Form
             _handledBmsCommandIds.Add(command.CommandId);
         }
 
-        return result;
-    }
-
-    private async Task<BridgeCommandHandlingResult> HandleRecoverRoundCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (!command.Shoe.HasValue || !command.Round.HasValue)
-        {
-            return BridgeCommandHandlingResult.Rejected("RecoverRound requires shoe and round.");
-        }
-
-        ShoeEndpoint? endpoint = FindEndpointForCommand(command);
-        if (endpoint == null)
-        {
-            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found.");
-        }
-
-        if (!endpoint.BmsTransmitEnabled)
-        {
-            return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
-        }
-
-        RecoverRoundBackoffDecision backoffDecision = _recoverRoundBackoff.GetDecision(command, DateTimeOffset.UtcNow);
-        if (!backoffDecision.ShouldAttempt)
-        {
-            return BridgeCommandHandlingResult.Deferred(
-                $"GameResult {command.Shoe}/{command.Round} was not found locally; retry after {FormatRetryDelay(backoffDecision.Delay)}.");
-        }
-
-        BridgeEventQuery query = new()
-        {
-            Type = "GameResult",
-            SourceDataCode = endpoint.SourceDataCode,
-            DeviceId = endpoint.DeviceId,
-            Shoe = command.Shoe,
-            Round = command.Round,
-            RoundId = command.RoundId,
-            Limit = 1
-        };
-
-        int count = await _eventJournal!
-            .RequeueMatchingEventsAsync(query, DateTime.UtcNow, $"BMS command {command.CommandId} RecoverRound")
-            .ConfigureAwait(false);
-        if (count <= 0)
-        {
-            RecoverRoundBackoffDecision retryDecision = _recoverRoundBackoff.RecordNotFound(command, DateTimeOffset.UtcNow);
-            AppendLog(endpoint, "API", $"BMS 補償要求找不到 GameResult {command.Shoe}/{command.Round}，{FormatRetryDelay(retryDecision.Delay)} 後重試。");
-            return BridgeCommandHandlingResult.NotFound($"GameResult {command.Shoe}/{command.Round} was not found locally.");
-        }
-
-        _recoverRoundBackoff.Clear(command);
-        AppendLog(endpoint, "API", $"BMS 補償要求已重新排送 GameResult {command.Shoe}/{command.Round}。");
-        _ = RefreshOutboxStatusesAsync();
-        return BridgeCommandHandlingResult.Handled($"Requeued {count} GameResult event(s).");
-    }
-
-    private static string FormatRetryDelay(TimeSpan delay)
-    {
-        int seconds = Math.Max(1, (int)Math.Ceiling(delay.TotalSeconds));
-        return $"{seconds.ToString(CultureInfo.InvariantCulture)} 秒";
-    }
-
-    private async Task<BridgeCommandHandlingResult> HandleResendEventCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (command.EventId.HasValue)
-        {
-            int requeuedById = await _eventJournal!
-                .RequeueEventAsync(command.EventId.Value, DateTime.UtcNow, $"BMS command {command.CommandId} ResendEvent")
-                .ConfigureAwait(false);
-            if (requeuedById <= 0)
-            {
-                return BridgeCommandHandlingResult.NotFound($"EventId {command.EventId.Value} was not found locally.");
-            }
-
-            AppendLog(FindEndpointForCommand(command), "API", $"BMS 要求重送事件 #{command.EventId.Value}，已重新排送。");
-            _ = RefreshOutboxStatusesAsync();
-            return BridgeCommandHandlingResult.Handled($"Requeued event #{command.EventId.Value}.");
-        }
-
-        ShoeEndpoint? endpoint = FindEndpointForCommand(command);
-        if (endpoint == null)
-        {
-            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found.");
-        }
-
-        if (!endpoint.BmsTransmitEnabled)
-        {
-            return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
-        }
-
-        if (string.IsNullOrWhiteSpace(command.EventType) && (!command.Shoe.HasValue || !command.Round.HasValue))
-        {
-            return BridgeCommandHandlingResult.Rejected("ResendEvent requires eventId or eventType with shoe and round.");
-        }
-
-        BridgeEventQuery query = new()
-        {
-            Type = command.EventType,
-            SourceDataCode = endpoint.SourceDataCode,
-            DeviceId = endpoint.DeviceId,
-            Shoe = command.Shoe,
-            Round = command.Round,
-            RoundId = command.RoundId,
-            Limit = 20
-        };
-
-        int requeuedCount = await _eventJournal!
-            .RequeueMatchingEventsAsync(query, DateTime.UtcNow, $"BMS command {command.CommandId} ResendEvent")
-            .ConfigureAwait(false);
-        if (requeuedCount <= 0)
-        {
-            return BridgeCommandHandlingResult.NotFound("No matching local events were found.");
-        }
-
-        AppendLog(endpoint, "API", $"BMS 要求重送 {requeuedCount} 筆事件，已重新排送。");
-        _ = RefreshOutboxStatusesAsync();
-        return BridgeCommandHandlingResult.Handled($"Requeued {requeuedCount} event(s).");
-    }
-
-    private ShoeEndpoint? FindEndpointForCommand(AngelBridgeCommand command)
-    {
-        return _endpoints.FirstOrDefault(endpoint =>
-            (string.IsNullOrWhiteSpace(command.SourceDataCode) ||
-                string.Equals(endpoint.SourceDataCode, command.SourceDataCode, StringComparison.OrdinalIgnoreCase)) &&
-            (string.IsNullOrWhiteSpace(command.DeviceId) ||
-                string.Equals(endpoint.DeviceId, command.DeviceId, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(endpoint.ShoeId, command.DeviceId, StringComparison.OrdinalIgnoreCase)));
+        return Task.FromResult(result);
     }
 
     private bool IsEventDispatchEnabled(BridgePendingEvent pending)
@@ -4663,7 +4525,7 @@ public partial class Form1 : Form
             string.Equals(candidate.SourceDataCode, pending.SourceDataCode, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(candidate.DeviceId, pending.DeviceId, StringComparison.OrdinalIgnoreCase));
 
-        return endpoint?.BmsTransmitEnabled ?? true;
+        return endpoint?.Enabled == true && endpoint.BmsTransmitEnabled;
     }
 
     private void UpdateApiUiState()
@@ -4686,7 +4548,7 @@ public partial class Form1 : Form
 
         if (btnJwtSettings != null) btnJwtSettings.Enabled = true;
         if (btnConnectionModeSettings != null) btnConnectionModeSettings.Enabled = true;
-        if (btnCopyToken != null) btnCopyToken.Enabled = !string.IsNullOrWhiteSpace(_settings.BmsToken);
+        if (btnCopyToken != null) btnCopyToken.Enabled = false;
         if (btnApiEdit != null) btnApiEdit.Visible = !_apiSettingsEditMode;
         if (btnApiApply != null) btnApiApply.Visible = _apiSettingsEditMode;
         if (btnApiCancel != null) btnApiCancel.Visible = _apiSettingsEditMode;
@@ -4818,9 +4680,7 @@ public partial class Form1 : Form
     private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
     {
         StopAutoRun();
-        CancelPendingNextRoundCountdown();
         _outboxStatusTimer.Stop();
-        _nextRoundCountdownTimer.Stop();
         _settings.Save();
         foreach (ShoeEndpoint endpoint in _endpoints)
         {
@@ -4833,8 +4693,8 @@ public partial class Form1 : Form
         }
 
         _bmsApiClient.Dispose();
+        DisposeBmsAccessTokenProvider();
         _outboxStatusTimer.Dispose();
-        _nextRoundCountdownTimer.Dispose();
     }
 
     private void Form1_Shown(object? sender, EventArgs e)
@@ -5500,41 +5360,39 @@ public sealed class ConnectionModeSettingsDialog : Form
 }
 
 /// <summary>
-/// Dialog used to edit the source provider JWT settings stored by the bridge.
+/// Dialog used to edit per-bridge BMS client credentials.
 /// </summary>
 public sealed class JwtSettingsDialog : Form
 {
     private readonly BridgeSettings _settings;
-    private readonly TextBox txtNameIdentifier = new() { Width = 520 };
-    private readonly TextBox txtSerialNumber = new() { Width = 520 };
-    private readonly TextBox txtIssuer = new() { Width = 520 };
-    private readonly TextBox txtAudience = new() { Width = 520 };
-    private readonly TextBox txtSigningKey = new() { Width = 520, UseSystemPasswordChar = true };
-    private readonly TextBox txtLifetimeMinutes = new() { Width = 120 };
+    private readonly TextBox txtBridgeId = new() { Width = 520 };
+    private readonly TextBox txtClientId = new() { Width = 520 };
+    private readonly TextBox txtClientSecret = new() { Width = 520, UseSystemPasswordChar = true };
 
     /// <summary>
-    /// Creates a JWT settings dialog for the supplied bridge settings.
+    /// Creates a client-credentials settings dialog for the supplied bridge settings.
     /// </summary>
     /// <param name="settings">Bridge settings to edit.</param>
     public JwtSettingsDialog(BridgeSettings settings)
     {
         _settings = settings;
 
-        Text = "JWT 設定";
+        Text = "BMS 認證設定";
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
-        ClientSize = new Size(740, 380);
+        ClientSize = new Size(740, 270);
         Font = new Font("Microsoft JhengHei", 10F, FontStyle.Regular);
         BackColor = Color.FromArgb(240, 244, 248);
 
-        txtNameIdentifier.Text = _settings.JwtNameIdentifier;
-        txtSerialNumber.Text = _settings.JwtSerialNumber;
-        txtIssuer.Text = _settings.JwtIssuer;
-        txtAudience.Text = _settings.JwtAudience;
-        txtSigningKey.Text = _settings.JwtSigningKey;
-        txtLifetimeMinutes.Text = _settings.JwtLifetimeMinutes.ToString(CultureInfo.InvariantCulture);
+        txtBridgeId.Text = _settings.BridgeId;
+        txtClientId.Text = _settings.BmsClientId;
+        txtClientSecret.Text = string.Empty;
+        txtClientSecret.PlaceholderText =
+            string.IsNullOrWhiteSpace(_settings.BmsClientSecret)
+                ? "請輸入 BMS 核發的 Client Secret"
+                : "已由 Windows DPAPI 安全保存；留空表示不變";
 
         TableLayoutPanel layout = new()
         {
@@ -5550,7 +5408,7 @@ public sealed class JwtSettingsDialog : Form
         Label hint = new()
         {
             Dock = DockStyle.Fill,
-            Text = "部署用設定。這些值必須對應 GCS SourceProviderTokens；Signing Key 必須與 BMS 端一致，否則 API 會回 401。",
+            Text = "使用每 Bridge 憑證取得短效 Token；Secret 以 Windows DPAPI 保存且不回填顯示，Token 與 Signing Key 均不保存。",
             ForeColor = Color.FromArgb(120, 40, 31),
             TextAlign = ContentAlignment.MiddleLeft
         };
@@ -5559,22 +5417,19 @@ public sealed class JwtSettingsDialog : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
-            RowCount = 6,
+            RowCount = 3,
             AutoSize = true
         };
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int i = 0; i < 6; i++)
+        for (int i = 0; i < 3; i++)
         {
             fields.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         }
 
-        AddField(fields, 0, "訊源商 ID:", txtNameIdentifier);
-        AddField(fields, 1, "訊源商序號:", txtSerialNumber);
-        AddField(fields, 2, "Issuer:", txtIssuer);
-        AddField(fields, 3, "Audience:", txtAudience);
-        AddField(fields, 4, "Signing Key:", txtSigningKey);
-        AddField(fields, 5, "有效分鐘:", txtLifetimeMinutes);
+        AddField(fields, 0, "Bridge ID:", txtBridgeId);
+        AddField(fields, 1, "Client ID:", txtClientId);
+        AddField(fields, 2, "Client Secret:", txtClientSecret);
 
         FlowLayoutPanel buttons = new()
         {
@@ -5599,29 +5454,47 @@ public sealed class JwtSettingsDialog : Form
 
     private void BtnOk_Click(object? sender, EventArgs e)
     {
-        if (IsMissing(txtNameIdentifier, "訊源商 ID")
-            || IsMissing(txtSerialNumber, "訊源商序號")
-            || IsMissing(txtIssuer, "Issuer")
-            || IsMissing(txtAudience, "Audience")
-            || IsMissing(txtSigningKey, "Signing Key"))
+        if (IsMissingOrPlaceholder(txtBridgeId, "Bridge ID")
+            || IsMissingOrPlaceholder(txtClientId, "Client ID"))
         {
             return;
         }
 
-        if (!int.TryParse(txtLifetimeMinutes.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int lifetime)
-            || lifetime <= 0)
+        string enteredSecret = txtClientSecret.Text.Trim();
+        if (enteredSecret.Length == 0 &&
+            string.IsNullOrWhiteSpace(_settings.BmsClientSecret))
         {
-            MessageBox.Show(this, "有效分鐘必須是大於 0 的整數。", "JWT 設定", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            txtLifetimeMinutes.Focus();
+            MessageBox.Show(
+                this,
+                "Client Secret 尚未設定。",
+                "BMS 認證設定",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            txtClientSecret.Focus();
             return;
         }
 
-        _settings.JwtNameIdentifier = txtNameIdentifier.Text.Trim();
-        _settings.JwtSerialNumber = txtSerialNumber.Text.Trim();
-        _settings.JwtIssuer = txtIssuer.Text.Trim();
-        _settings.JwtAudience = txtAudience.Text.Trim();
-        _settings.JwtSigningKey = txtSigningKey.Text.Trim();
-        _settings.JwtLifetimeMinutes = lifetime;
+        if (enteredSecret.Contains("REPLACE", StringComparison.OrdinalIgnoreCase) ||
+            enteredSecret.Contains("PLACEHOLDER", StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(
+                this,
+                "Client Secret 不可使用範例 placeholder。",
+                "BMS 認證設定",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            txtClientSecret.Focus();
+            return;
+        }
+
+        _settings.BridgeId = txtBridgeId.Text.Trim();
+        _settings.BmsClientId = txtClientId.Text.Trim();
+        if (enteredSecret.Length > 0)
+        {
+            _settings.BmsClientSecret = enteredSecret;
+        }
+        _settings.BmsToken = string.Empty;
+        _settings.JwtSigningKey = string.Empty;
 
         DialogResult = DialogResult.OK;
         Close();
@@ -5641,14 +5514,22 @@ public sealed class JwtSettingsDialog : Form
         fields.Controls.Add(control, 1, row);
     }
 
-    private bool IsMissing(TextBox textBox, string fieldName)
+    private bool IsMissingOrPlaceholder(TextBox textBox, string fieldName)
     {
-        if (!string.IsNullOrWhiteSpace(textBox.Text))
+        string value = textBox.Text.Trim();
+        if (!string.IsNullOrWhiteSpace(value) &&
+            !value.Contains("REPLACE", StringComparison.OrdinalIgnoreCase) &&
+            !value.Contains("PLACEHOLDER", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        MessageBox.Show(this, $"{fieldName} 不可空白。", "JWT 設定", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        MessageBox.Show(
+            this,
+            $"{fieldName} 不可空白或使用範例 placeholder。",
+            "BMS 認證設定",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
         textBox.Focus();
         return true;
     }

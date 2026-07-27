@@ -108,6 +108,33 @@ public sealed class WorkerSettings
             throw new InvalidOperationException("Bms:EventApiUrl 不可為空。");
         }
 
+        if (!Uri.TryCreate(Bms.EventApiUrl, UriKind.Absolute, out Uri? eventApiUri) ||
+            !string.Equals(eventApiUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(eventApiUri.Host))
+        {
+            throw new InvalidOperationException(
+                "Bms:EventApiUrl 必須是完整的 HTTPS 位址；不允許 HTTP 或省略 scheme。");
+        }
+
+        bool hasBmsSender = Shoes.Any(static shoe => shoe.Enabled && shoe.BmsTransmitEnabled);
+        if (hasBmsSender)
+        {
+            if (Bms.AutoGenerateJwt ||
+                !string.IsNullOrWhiteSpace(Bms.JwtSigningKey) ||
+                !string.IsNullOrWhiteSpace(Bms.Token))
+            {
+                throw new InvalidOperationException(
+                    "BMS 傳送已啟用，但固定 Token 與 AutoGenerateJwt/JwtSigningKey 舊模式已停用；" +
+                    "請改由 ANGEL 專用 client-credentials access-token provider 取得短效 Token。");
+            }
+
+            if (IsMissingSecret(Bms.ClientId) || IsMissingSecret(Bms.ClientSecret))
+            {
+                throw new InvalidOperationException(
+                    "BMS 傳送已啟用，但 Bms:ClientId / ClientSecret 尚未安全設定。");
+            }
+        }
+
         if (Shoes.Count == 0)
         {
             throw new InvalidOperationException("Shoes 至少要設定一張桌。");
@@ -150,15 +177,24 @@ public sealed class WorkerSettings
             }
         }
     }
+
+    private static bool IsMissingSecret(string value) =>
+        string.IsNullOrWhiteSpace(value) ||
+        value.Contains("REPLACE", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("PLACEHOLDER", StringComparison.OrdinalIgnoreCase);
 }
 
 public sealed class BmsWorkerSettings
 {
     public string EventApiUrl { get; set; } = "https://redhood67.infinitybeyonder888test.com/api/source/angel/events";
 
+    public string ClientId { get; set; } = string.Empty;
+
+    public string ClientSecret { get; set; } = string.Empty;
+
     public string Token { get; set; } = string.Empty;
 
-    public bool AutoGenerateJwt { get; set; } = true;
+    public bool AutoGenerateJwt { get; set; }
 
     public string JwtNameIdentifier { get; set; } = "899e293f-cf47-46b0-bde0-2ed3c7395f17";
 
@@ -175,6 +211,8 @@ public sealed class BmsWorkerSettings
     public void Normalize()
     {
         EventApiUrl = EventApiUrl.Trim();
+        ClientId = ClientId.Trim();
+        ClientSecret = ClientSecret.Trim();
         Token = Token.Trim();
         JwtNameIdentifier = JwtNameIdentifier.Trim();
         JwtSerialNumber = JwtSerialNumber.Trim();
@@ -206,9 +244,13 @@ public sealed class BridgeWorkerSettings
 
     public bool AutoConnect { get; set; } = true;
 
-    public bool AutoStartRoundOnConnect { get; set; } = true;
+    /// <summary>
+    /// Retained only so old configuration files deserialize cleanly.
+    /// Normalization always forces this retired behavior off.
+    /// </summary>
+    public bool AutoStartRoundOnConnect { get; set; } = false;
 
-    public bool AutoStartNextRoundAfterResult { get; set; } = true;
+    public bool AutoStartNextRoundAfterResult { get; set; } = false;
 
     public int ResultToNextRoundDelaySeconds { get; set; } = 3;
 
@@ -230,6 +272,7 @@ public sealed class BridgeWorkerSettings
         BridgeId = string.IsNullOrWhiteSpace(BridgeId) ? Environment.MachineName : BridgeId.Trim();
         BridgeName = string.IsNullOrWhiteSpace(BridgeName) ? "AngelEyeBridge" : BridgeName.Trim();
         ConnectionMode = ShoeConnectionMode.Normalize(ConnectionMode);
+        AutoStartRoundOnConnect = false;
         TotalBetTimeSeconds = Math.Clamp(TotalBetTimeSeconds, 5, 120);
         ResultToNextRoundDelaySeconds = Math.Clamp(ResultToNextRoundDelaySeconds, 0, 60);
         ReconnectSeconds = Math.Clamp(ReconnectSeconds, 3, 300);

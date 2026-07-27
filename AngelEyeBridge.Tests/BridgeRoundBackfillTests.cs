@@ -46,7 +46,8 @@ public sealed class BridgeRoundBackfillTests : IDisposable
 
         Assert.True(reader.Read());
         Assert.Equal(8, reader.GetInt64(0));
-        Assert.Equal("Dealing", reader.GetString(1));
+        Assert.Equal("AlignmentRequired", reader.GetString(1));
+        Assert.Equal("[]", reader.GetString(2));
         Assert.True(reader.IsDBNull(3));
         Assert.Equal(0, reader.GetInt32(4));
         Assert.False(reader.Read());

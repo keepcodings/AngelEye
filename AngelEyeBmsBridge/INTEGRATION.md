@@ -104,13 +104,13 @@ Windows 程式無參數啟動時是營運查詢台。既有總覽、牌局、異
 
 | 欄位 | 說明 |
 | --- | --- |
-| 事件 API 路徑 | BMS 提供的 HTTP endpoint，例如 `https://bms.example.com/api/source/angel/events` |
-| Token | 唯讀。Bridge 會依預先配置的訊源商 JWT 參數自動產生，並以 `Authorization: Bearer <token>` 帶出 |
-| JWT設定 | 部署人員設定訊源商 ID、序號、issuer、audience、signing key 與 token 有效分鐘 |
-| 複製Token | 一鍵複製目前 token，方便現場人員貼給系統管理員查核 |
+| 事件 API 路徑 | BMS 提供的 HTTPS endpoint，例如 `https://bms.example.com/api/source/angel/events` |
+| BMS 認證 | 只顯示 client-credentials 是否完成；不顯示 access token |
+| 認證設定 | 部署人員設定 BMS 核發的 Bridge ID、Client ID 與 Client Secret |
+| Token | 不可顯示或複製；只在程式記憶體內短暫快取並於到期前刷新 |
 | 開始傳送 / 停止傳送 | 控制 SQLite Outbox 背景 dispatcher 是否開始 POST 到 BMS；停止時新事件仍會先落地保存 |
 
-若 API 路徑未輸入 scheme，Bridge 會自動補 `http://`。
+API 路徑必須是完整 HTTPS URL；HTTP 或省略 scheme 會被拒絕。
 
 Bridge 會由事件 API 路徑自動推導補償查詢路徑。例如事件 API 設定為：
 
@@ -124,30 +124,11 @@ https://bms.example.com/api/source/angel/events
 https://bms.example.com/api/source/angel/recoveries/check
 ```
 
-Token 本身不提供手動修改。BMS 建立訊源商後，部署人員可透過 `JWT設定` 填入訊源商 ID、序號、issuer、audience、signing key 與有效分鐘；Bridge 會自動重新產生 JWT 並保存到本機 SQLite 設定表。
-
-GCS 目前要求 token 有 `exp`，因此 Bridge 會依「有效分鐘」產生 `exp` claim。預設 issuer / audience 對應 GCS 的 SourceProvider token 設定：
-
-```json
-{
-  "iss": "gs.com",
-  "aud": "BMS RESTful API"
-}
-```
-
-payload 會包含：
-
-```json
-{
-  "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier": "<訊源商 ID>",
-  "http://schemas.microsoft.com/ws/2008/06/identity/claims/serialnumber": "<訊源商序號>",
-  "iss": "gs.com",
-  "aud": "BMS RESTful API",
-  "exp": 1780000000
-}
-```
-
-Signing key 必須與 GCS `SourceProviderTokens.IssuerSigningKey` 一致，否則 API 會回 401。此值不應交由現場廠商自行修改。開發版預設帶入 DEV / Development 的 SourceProvider signing key，方便本機測試；QA / Production 部署時必須由部署設定覆寫成對應環境值。若設定檔仍為空，GUI 會顯示 `未配置 JWT Signing Key`，且不允許開始傳送。
+Bridge 會從事件 API 自動推導 `POST /api/source/angel/token`，以 JSON
+`{"clientId":"...","clientSecret":"..."}` 取得綁定該 Bridge 與桌台／牌盒範圍的短效
+Bearer token。事件、heartbeat 與 recovery 共用同一個 request-time token provider；
+快到期時自動刷新。Bridge 不保存 access token，也不再持有或使用 BMS 共用 HMAC
+signing key。Token 回傳的 `bridgeId` 若與設定不完全相同，dispatcher 會 fail closed。
 
 ### 2.2 桌台 / 端點清單
 
@@ -331,11 +312,11 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 
 ### 4.1 `StartGame`
 
-Bridge 在偵測到新局第一張牌前，會先送出 `StartGame`，讓 BMS 進入倒數狀態。此事件只更新即時桌況，不寫入賽果 DB。
+只有在 Worker 已取得並持久化可信的新局 boundary 後，才會建立 `StartGame`，讓 BMS 進入倒數狀態。單純啟動、連上或重連 MOXA 都不代表新局，也不得建立 `StartGame`。此事件只更新即時桌況，不寫入賽果 DB。
 
-收到上一局 `GameResult` 後，Bridge 會保留 GUI 結果畫面 3 秒，再自動進入下一局下注倒數並送下一局 `StartGame`。正式 read-only 模式下，Bridge 不會對實體牌盒送 `Lock ON / Lock OFF`；若工程授權已啟用，才會在結果保留期間嘗試以 `OP LK` 鎖定並於下一局倒數前解除。`R` retransmission 不代表新局開始，不會觸發倒數或 `StartGame`。這個 3 秒保留是 Bridge / BMS 流程設計，不是 Angel Eye II-EX 硬體保證會在結算後自行送下一局訊號。
+目前部署範本一律使用 `autoStartRoundOnConnect=false` 與 `autoStartNextRoundAfterResult=false`。收到上一局 `GameResult` 後不以固定秒數推測下一局；在 Angel Eye II-EX 的實體新局 boundary 尚未完成現場驗證前，Worker 保持等待／人工對齊，不補造下一局 `StartGame`。`R` retransmission 也不代表新局開始。工程 GUI 的模擬跑局與手動測試不得視為正式 Worker 的 boundary 來源。
 
-收到 `CutCardDrawn` 後，Bridge 不會自動下一局，會標記此靴已到鞋尾並停止自動跑局。正式 read-only 模式下，Bridge 只靠流程狀態忽略未按 `新靴` 前收到的後續實體牌面；若工程授權已啟用，才會嘗試對實體牌盒送出 `Lock ON`。現場停靴 / 換靴完成後，操作員按 GUI `新靴`；Bridge 會切到下一個靴號、清除鞋尾狀態，並立即進入新靴第 1 局下注倒數，送出新靴第 1 局 `StartGame`。
+收到 `CutCardDrawn` 後，Bridge 不會自動下一局，會標記此靴已到鞋尾並停止自動跑局。正式 read-only 模式下，Bridge 只靠流程狀態忽略未按 `新靴` 前收到的後續實體牌面；若工程授權已啟用，才會嘗試對實體牌盒送出 `Lock ON`。現場停靴 / 換靴完成後，操作員按 GUI `新靴`只會更新本機靴號、清除鞋尾狀態；仍須等待可信開局 boundary，不能因按鈕本身立即送出 `StartGame`。
 
 ```json
 {
@@ -359,6 +340,8 @@ Bridge 在偵測到新局第一張牌前，會先送出 `StartGame`，讓 BMS �
   "type": "CardDrawn",
   "state": "Dealing",
   "data": {
+    "eventCode": "D",
+    "accepted": true,
     "target": "Player",
     "index": 1,
     "suit": "Heart",
@@ -367,11 +350,11 @@ Bridge 在偵測到新局第一張牌前，會先送出 `StartGame`，讓 BMS �
 }
 ```
 
-`target` 為 `Player` 或 `Banker`。`index` 為該方第幾張牌。此事件語意接近 T9 `KeyPress`，只更新即時牌面，不寫入賽果 DB。若此牌盒已收到 `CutCardDrawn` 但尚未按 GUI `新靴`，Bridge 會忽略後續實體 `D` 牌面，不送 `StartGame` 或 `CardDrawn` 到 BMS。
+`eventCode` 必須是實際發牌 `D`，且 `accepted=true` 才能寫入本機 authoritative card projection；`R` retransmission、格式錯誤或與已保存位置衝突的牌只保留 raw evidence，不覆寫既有牌面。`target` 為 `Player` 或 `Banker`，`index` 為該方第幾張牌。此事件只更新本機牌面證據，不寫入 BMS 賽果 DB。若此牌盒已收到 `CutCardDrawn` 但尚未執行有 actionId 與 reason 的 `NewShoeConfirmed`，Bridge 會忽略後續實體 `D` 牌面，不送 `StartGame` 或 `GameResult` 到 BMS。
 
 ### 4.3 `GameResult`
 
-`GameResult` 語意接近 T9 `Settle`。BMS 端應只在此事件寫入 `GameResultBAC`。Bridge 收到 `GameResult` 後會排程 3 秒後進入下一局倒數，GUI 結果橫幅會顯示這 3 秒保留倒數條。正式 read-only 模式下不會送實體牌盒命令；只有工程授權啟用時，Bridge 才會在結果保留期間對實體牌盒送 `Lock ON`，並在準備進下一局倒數前送 `Lock OFF`。Mock 不送實體命令，只套用相同 GUI / BMS 流程。斷線、新靴、Mock 重置、錯誤、切牌、收到下一局第一張牌、移除牌盒或關閉程式都會取消尚未執行的下一局倒數排程。
+`GameResult` 語意接近 T9 `Settle`。BMS 端只在通過 StartGame、牌面完整性與事件 identity 檢查後寫入 `GameResultBAC`。正式 Worker 預設 `autoStartNextRoundAfterResult=false`，結果只讓狀態進入 `WaitingForRoundBoundary`，不以固定秒數補造下一局。`DerivedAfterPreviousResult` 僅供經批准的 QA 驗證，且斷線、新靴、錯誤、切牌、先到的牌訊或另一 terminal event 都會取消 timer。正式 read-only 模式不送任何實體牌盒控制命令。
 
 ```json
 {
@@ -415,7 +398,7 @@ Bridge 在偵測到新局第一張牌前，會先送出 `StartGame`，讓 BMS �
 }
 ```
 
-Bridge 收到切牌事件後會標記此靴即將結束。正式 read-only 模式下不會對實體牌盒送命令；只有工程授權啟用時，才會嘗試送出 `Lock ON`。現場流程上應停靴 / 換靴；使用 GUI `新靴` 後，Bridge 會讓靴號加 1，並立即進入新靴第 1 局下注倒數。跨日換靴時會依日期從 `yyyyMMdd001` 開始。未按 `新靴` 前收到的實體牌面仍會被忽略，避免送出錯靴號 / 錯局號資料。
+Bridge 收到切牌事件後會取消待開局 timer，並持久保存 `ShoeEnding/ShoeChangePending`。現場停靴與實體換靴完成後，操作員才可執行帶有唯一 `actionId` 與非敏感 `reason` 的 `NewShoeConfirmed`；相同 actionId 重複提交不會再次加靴。確認後只切換到新靴 round 0，仍須等待可信 boundary，不會立即建立第 1 局倒數或 `StartGame`。跨日換靴時靴號依日期從 `yyyyMMdd001` 開始。
 
 ### 4.4 `Error`
 
@@ -460,7 +443,7 @@ Bridge 收到切牌事件後會標記此靴即將結束。正式 read-only 模�
 
 ## 5. 回查與保存
 
-Bridge 目前不提供 HTTP 查詢服務。事件與 Outbox 狀態會寫入執行目錄：
+Worker 提供僅限內部監控使用的 Health／Query API；QA 預設只監聽 `127.0.0.1:18080`，Windows 查詢台需透過核准的 SSH tunnel 存取。事件與 outbox 狀態寫入：
 
 ```text
 bridge-events.sqlite
@@ -480,7 +463,7 @@ Mock 行為：
 
 - `模擬發牌`：依百家樂發牌流程注入下一張 `CardDrawn`；單局最多閒 / 莊各 3 張。若本局不應再抽牌而仍按下，會模擬 `Error / Overdraw`。
 - `模擬結算`：依目前 GUI 牌面計算閒 / 莊點數、輸贏與對子；同一局只會送出一次 `GameResult`，並與實體 `GameResult` 一樣保留結果 3 秒後才進入下一局倒數。
-- `模擬切牌`：模擬現場抽到切牌，Bridge 會送出 `CutCardDrawn`、標記 `ShoeEnding`、停止自動跑局並取消下一局倒數；後續需由操作員按 `新靴` 模擬現場停靴 / 換靴確認，按下後會直接進入新靴第 1 局倒數。
+- `模擬切牌`：模擬現場抽到切牌，Bridge 會送出 `CutCardDrawn`、標記 `ShoeEnding`、停止自動跑局並取消下一局倒數；後續需由操作員按 `新靴` 模擬現場停靴 / 換靴確認，按下後只切到新靴 round 0，不直接建立 `StartGame`。
 - `自動跑局`：自動發閒 1、莊 1、閒 2、莊 2，再依標準百家樂規則補第三張並結算；結算後同樣保留結果 3 秒，再進入下一局倒數。若開啟 N 局後切牌設定，會在完成第 N 局結算且保留結果 3 秒後注入 `C`，停止自動跑局並走 `CutCardDrawn` / `ShoeEnding` 流程。
 - `重置測試`：停止自動跑局，清空本機 Mock 牌面、結算橫幅與模擬錯誤狀態；不變更靴號。下一次 `模擬發牌` 會從新一局第一張開始。
 

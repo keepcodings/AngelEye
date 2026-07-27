@@ -11,6 +11,7 @@ public sealed class ShoeEndpoint
     private byte _simSeqCt = 0x31;
     private bool _roundInProgress;
     private bool _roundSettled = true;
+    private readonly object _stateTransitionGate = new();
 
     /// <summary>
     /// Creates an endpoint backed by the provided persistent settings.
@@ -20,15 +21,40 @@ public sealed class ShoeEndpoint
     {
         Settings = settings;
         EnsureGameNumberInitialized();
-        Listener.OnStatusChanged += HandleStatusChanged;
+        Listener.OnStatusChanged += value =>
+            ExecuteSerializedStateTransition(() => HandleStatusChanged(value));
+        Listener.OnProtocolSignalObserved += value =>
+            ExecuteSerializedStateTransition(() => ProtocolSignalObserved?.Invoke(this, value));
+        Listener.OnTransportStateChanged += value =>
+            ExecuteSerializedStateTransition(() => HandleTransportStateChanged(value));
         Listener.OnRawDataLogged += (type, data) => LogReceived?.Invoke(this, type, data);
-        Listener.OnCardDrawn += HandleCardDrawn;
-        Listener.OnGameResult += HandleGameResult;
-        Listener.OnErrorOccurred += HandleErrorOccurred;
-        Listener.OnLockStatusChanged += HandleLockStatusChanged;
-        Listener.OnErrorCleared += HandleErrorCleared;
-        Listener.OnCommandAcknowledged += HandleCommandAcknowledged;
-        Listener.OnCuttingCardDrawn += HandleCuttingCardDrawn;
+        Listener.OnCardDrawn += value =>
+            ExecuteSerializedStateTransition(() => HandleCardDrawn(value));
+        Listener.OnGameResult += value =>
+            ExecuteSerializedStateTransition(() => HandleGameResult(value));
+        Listener.OnErrorOccurred += value =>
+            ExecuteSerializedStateTransition(() => HandleErrorOccurred(value));
+        Listener.OnLockStatusChanged += value =>
+            ExecuteSerializedStateTransition(() => HandleLockStatusChanged(value));
+        Listener.OnErrorCleared += (code, message) =>
+            ExecuteSerializedStateTransition(() => HandleErrorCleared(code, message));
+        Listener.OnCommandAcknowledged += value =>
+            ExecuteSerializedStateTransition(() => HandleCommandAcknowledged(value));
+        Listener.OnCuttingCardDrawn += value =>
+            ExecuteSerializedStateTransition(() => HandleCuttingCardDrawn(value));
+    }
+
+    /// <summary>
+    /// Runs one endpoint lifecycle transition under the same re-entrant gate used by
+    /// decoded protocol, transport, timer, and operator events.
+    /// </summary>
+    public void ExecuteSerializedStateTransition(Action transition)
+    {
+        ArgumentNullException.ThrowIfNull(transition);
+        lock (_stateTransitionGate)
+        {
+            transition();
+        }
     }
 
     /// <summary>Persistent settings used by this endpoint.</summary>
@@ -182,6 +208,36 @@ public sealed class ShoeEndpoint
     /// <summary>Gets whether the cutting card has been drawn and the shoe is ending.</summary>
     public bool ShoeEnding { get; private set; }
 
+    /// <summary>Durable physical-round phase used to fail closed across process restarts.</summary>
+    public string RoundPhase { get; private set; } = BridgeRoundPhases.AwaitingSynchronization;
+
+    /// <summary>Boundary policy that armed the current round.</summary>
+    public string BoundaryStrategy { get; private set; } = BridgeBoundaryStrategies.DisabledUntilValidated;
+
+    /// <summary>UTC timestamp of the boundary that armed the current round.</summary>
+    public DateTimeOffset? BoundaryObservedAtUtc { get; private set; }
+
+    /// <summary>Stable StartGame identity allocated with the current round boundary.</summary>
+    public Guid? StartGameEventUid { get; private set; }
+
+    /// <summary>Last durable StartGame delivery state for the current round.</summary>
+    public string StartGameDeliveryState { get; private set; } = string.Empty;
+
+    /// <summary>UTC timestamp of the last physical final-result telegram.</summary>
+    public DateTimeOffset? LastFinalResultAtUtc { get; private set; }
+
+    /// <summary>Non-sensitive reason why the endpoint requires manual alignment.</summary>
+    public string AlignmentReason { get; private set; } = string.Empty;
+
+    /// <summary>Last idempotency key used to confirm a physical new shoe.</summary>
+    public string LastNewShoeActionId { get; private set; } = string.Empty;
+
+    /// <summary>Non-sensitive operator reason for the last new-shoe confirmation.</summary>
+    public string LastNewShoeReason { get; private set; } = string.Empty;
+
+    /// <summary>UTC time of the last audited new-shoe confirmation.</summary>
+    public DateTimeOffset? LastNewShoeConfirmedAtUtc { get; private set; }
+
     /// <summary>Gets the last shoe error code, if any.</summary>
     public int? ErrorCode { get; private set; }
 
@@ -193,6 +249,9 @@ public sealed class ShoeEndpoint
 
     /// <summary>Gets when the last endpoint event was observed.</summary>
     public DateTime? LastEventAt { get; private set; }
+
+    /// <summary>Gets when the last card or card-status telegram was observed.</summary>
+    public DateTimeOffset? LastCardAtUtc { get; private set; }
 
     /// <summary>Gets the last endpoint event summary.</summary>
     public string LastEventText { get; private set; } = string.Empty;
@@ -251,6 +310,12 @@ public sealed class ShoeEndpoint
     /// <summary>Raised when a game result is parsed.</summary>
     public event Action<ShoeEndpoint, SerialListener.GameResult>? GameResultReceived;
 
+    /// <summary>Raised for typed S/P protocol observations.</summary>
+    public event Action<ShoeEndpoint, SerialListener.ProtocolSignal>? ProtocolSignalObserved;
+
+    /// <summary>Raised when the physical transport lifecycle changes.</summary>
+    public event Action<ShoeEndpoint, SerialListener.TransportState>? TransportStateChanged;
+
     /// <summary>Raised when the shoe reports an error.</summary>
     public event Action<ShoeEndpoint, SerialListener.ErrorInfo>? ErrorOccurred;
 
@@ -262,6 +327,12 @@ public sealed class ShoeEndpoint
 
     /// <summary>Raised when the cutting card is drawn.</summary>
     public event Action<ShoeEndpoint, SerialListener.CutCardInfo>? CuttingCardDrawn;
+
+    /// <summary>
+    /// Controls whether card/result telegrams may allocate a round implicitly.
+    /// The headless Worker disables this so only its serialized boundary policy advances rounds.
+    /// </summary>
+    public bool AutoAdvanceRoundFromEvents { get; set; } = false;
 
     /// <summary>
     /// Connects the endpoint to its configured serial port or mock listener.
@@ -396,6 +467,13 @@ public sealed class ShoeEndpoint
         _roundInProgress = false;
         _roundSettled = true;
         ShoeEnding = false;
+        RoundPhase = BridgeRoundPhases.ConnectedWaitingBoundary;
+        BoundaryStrategy = BridgeBoundaryStrategies.DisabledUntilValidated;
+        BoundaryObservedAtUtc = null;
+        StartGameEventUid = null;
+        StartGameDeliveryState = string.Empty;
+        LastFinalResultAtUtc = null;
+        AlignmentReason = string.Empty;
         ClearBetCountdown(notify: false);
         LastEventAt = DateTime.Now;
         LastEventText = $"Game number {CurrentShoe}/{CurrentRound}";
@@ -407,12 +485,59 @@ public sealed class ShoeEndpoint
     /// </summary>
     public void StartNewShoe(DateTime? now = null)
     {
+        _ = ConfirmNewShoe(
+            $"local-{Guid.NewGuid():N}",
+            "Local engineering new-shoe confirmation.",
+            now);
+    }
+
+    /// <summary>
+    /// Applies an audited, idempotent physical new-shoe confirmation.
+    /// Repeating the same action identifier does not advance the shoe again.
+    /// Confirmation resets to round zero and never creates StartGame.
+    /// </summary>
+    public bool ConfirmNewShoe(
+        string actionId,
+        string reason,
+        DateTime? now = null)
+    {
+        string normalizedActionId = actionId?.Trim() ?? string.Empty;
+        string normalizedReason = reason?.Trim() ?? string.Empty;
+        if (normalizedActionId.Length == 0)
+        {
+            throw new ArgumentException(
+                "New-shoe action ID is required.",
+                nameof(actionId));
+        }
+
+        if (normalizedReason.Length == 0)
+        {
+            throw new ArgumentException(
+                "New-shoe reason is required.",
+                nameof(reason));
+        }
+
+        if (string.Equals(
+                LastNewShoeActionId,
+                normalizedActionId,
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+
         CurrentShoe = BridgeGameNumbering.NextShoe(CurrentShoe, now);
         CurrentRound = 0;
         CurrentRoundId = null;
         _roundInProgress = false;
         _roundSettled = true;
         ShoeEnding = false;
+        RoundPhase = BridgeRoundPhases.ConnectedWaitingBoundary;
+        BoundaryStrategy = BridgeBoundaryStrategies.DisabledUntilValidated;
+        BoundaryObservedAtUtc = null;
+        StartGameEventUid = null;
+        StartGameDeliveryState = string.Empty;
+        LastFinalResultAtUtc = null;
+        AlignmentReason = string.Empty;
         PlayerCards.Clear();
         BankerCards.Clear();
         GameResultText = string.Empty;
@@ -420,7 +545,11 @@ public sealed class ShoeEndpoint
         ClearBetCountdown(notify: false);
         LastEventAt = DateTime.Now;
         LastEventText = $"New shoe {CurrentShoe}";
+        LastNewShoeActionId = normalizedActionId;
+        LastNewShoeReason = normalizedReason;
+        LastNewShoeConfirmedAtUtc = DateTimeOffset.UtcNow;
         RaiseStateChanged();
+        return true;
     }
 
     /// <summary>
@@ -466,7 +595,8 @@ public sealed class ShoeEndpoint
     }
 
     /// <summary>
-    /// Clears visible cards, result banner, shoe-ending state, and betting countdown.
+    /// Clears visible cards, result banner, and betting countdown.
+    /// The safety-critical shoe-ending state is intentionally preserved.
     /// </summary>
     public void ClearPreview()
     {
@@ -474,10 +604,173 @@ public sealed class ShoeEndpoint
         BankerCards.Clear();
         GameResultText = string.Empty;
         GameResultColor = Color.White;
-        ShoeEnding = false;
         ClearBetCountdown(notify: false);
         RaiseStateChanged();
     }
+
+    /// <summary>
+    /// Restores safety-critical runtime state persisted by the headless Worker.
+    /// This does not advance the shoe or round and never creates StartGame.
+    /// </summary>
+    public void RestoreRuntimeState(ShoeRuntimeState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ShoeEnding = state.ShoeEnding;
+        RoundPhase = BridgeRoundPhases.Normalize(state.RoundPhase);
+        BoundaryStrategy = BridgeBoundaryStrategies.Normalize(state.BoundaryStrategy);
+        BoundaryObservedAtUtc = state.BoundaryObservedAtUtc;
+        StartGameEventUid = state.StartGameEventUid;
+        StartGameDeliveryState = state.StartGameDeliveryState?.Trim() ?? string.Empty;
+        LastFinalResultAtUtc = state.LastFinalResultAtUtc;
+        AlignmentReason = state.AlignmentReason?.Trim() ?? string.Empty;
+        LastNewShoeActionId = state.LastNewShoeActionId?.Trim() ?? string.Empty;
+        LastNewShoeReason = state.LastNewShoeReason?.Trim() ?? string.Empty;
+        LastNewShoeConfirmedAtUtc = state.LastNewShoeConfirmedAtUtc;
+
+        PlayerCards.Clear();
+        PlayerCards.AddRange(state.PlayerCards.Select(CloneCard));
+        BankerCards.Clear();
+        BankerCards.AddRange(state.BankerCards.Select(CloneCard));
+
+        _roundInProgress = RoundPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing;
+        _roundSettled = !_roundInProgress;
+        if (ShoeEnding || RoundPhase is BridgeRoundPhases.AlignmentRequired or BridgeRoundPhases.ShoeChangePending)
+        {
+            ClearBetCountdown(notify: false);
+        }
+    }
+
+    /// <summary>
+    /// Compatibility overload for callers that only persist the shoe-ending flag.
+    /// Such state cannot prove round continuity and therefore remains fail closed.
+    /// </summary>
+    public void RestoreRuntimeState(bool shoeEnding)
+    {
+        RestoreRuntimeState(CaptureRuntimeState() with
+        {
+            ShoeEnding = shoeEnding,
+            RoundPhase = shoeEnding
+                ? BridgeRoundPhases.ShoeChangePending
+                : BridgeRoundPhases.AlignmentRequired,
+            AlignmentReason = "Legacy runtime state does not prove round continuity."
+        });
+    }
+
+    /// <summary>Moves the current physical round into a fail-closed alignment state.</summary>
+    public void MarkAlignmentRequired(string reason)
+    {
+        RoundPhase = BridgeRoundPhases.AlignmentRequired;
+        AlignmentReason = string.IsNullOrWhiteSpace(reason)
+            ? "Round continuity cannot be proven."
+            : reason.Trim();
+        ClearBetCountdown(notify: false);
+        _roundInProgress = false;
+        _roundSettled = true;
+    }
+
+    /// <summary>Records a trusted or explicitly configured boundary for the current round.</summary>
+    public void ArmRoundBoundary(string strategy, DateTimeOffset observedAtUtc, Guid eventUid)
+    {
+        if (eventUid == Guid.Empty)
+        {
+            throw new ArgumentException("StartGame eventUid must not be empty.", nameof(eventUid));
+        }
+
+        RoundPhase = BridgeRoundPhases.Countdown;
+        BoundaryStrategy = BridgeBoundaryStrategies.Normalize(strategy);
+        BoundaryObservedAtUtc = observedAtUtc;
+        StartGameEventUid = eventUid;
+        StartGameDeliveryState = "Prepared";
+        AlignmentReason = string.Empty;
+        LastFinalResultAtUtc = null;
+        _roundInProgress = true;
+        _roundSettled = false;
+    }
+
+    /// <summary>Records the durable local delivery state of the current StartGame.</summary>
+    public void MarkStartGameStored(string deliveryState)
+    {
+        StartGameDeliveryState = deliveryState?.Trim() ?? string.Empty;
+    }
+
+    /// <summary>Marks the armed current round as dealing.</summary>
+    public void MarkDealing()
+    {
+        if (StartGameEventUid.HasValue &&
+            RoundPhase is not BridgeRoundPhases.AlignmentRequired and not BridgeRoundPhases.ShoeChangePending)
+        {
+            RoundPhase = BridgeRoundPhases.Dealing;
+            _roundInProgress = true;
+            _roundSettled = false;
+        }
+    }
+
+    /// <summary>Records a physical terminal result without allocating the next round.</summary>
+    public void MarkFinalResultStored(DateTimeOffset observedAtUtc, string result)
+    {
+        string previousPhase = RoundPhase;
+        LastFinalResultAtUtc = observedAtUtc;
+        ClearBetCountdown(notify: false);
+        _roundInProgress = false;
+        _roundSettled = true;
+        if (previousPhase is BridgeRoundPhases.AlignmentRequired or BridgeRoundPhases.ShoeChangePending)
+        {
+            // A terminal telegram is useful local evidence, but it cannot repair missing,
+            // corrupt, disconnected, or shoe-change state by itself.
+            return;
+        }
+
+        if (string.Equals(result, "ForceQuit", StringComparison.OrdinalIgnoreCase))
+        {
+            RoundPhase = BridgeRoundPhases.Cancelled;
+        }
+        else if (!string.Equals(result, "PlayerWin", StringComparison.OrdinalIgnoreCase) &&
+                 !string.Equals(result, "BankerWin", StringComparison.OrdinalIgnoreCase) &&
+                 !string.Equals(result, "Tie", StringComparison.OrdinalIgnoreCase))
+        {
+            MarkAlignmentRequired($"Unknown terminal result '{result}'.");
+        }
+        else
+        {
+            RoundPhase = BridgeRoundPhases.WaitingForRoundBoundary;
+        }
+    }
+
+    /// <summary>Persists the cut-card hold until an audited new-shoe action clears it.</summary>
+    public void MarkShoeChangePending()
+    {
+        ShoeEnding = true;
+        RoundPhase = BridgeRoundPhases.ShoeChangePending;
+        ClearBetCountdown(notify: false);
+        _roundInProgress = false;
+        _roundSettled = true;
+    }
+
+    /// <summary>Captures a deep copy suitable for durable persistence.</summary>
+    public ShoeRuntimeState CaptureRuntimeState() => new()
+    {
+        ShoeEnding = ShoeEnding,
+        RoundPhase = RoundPhase,
+        BoundaryStrategy = BoundaryStrategy,
+        BoundaryObservedAtUtc = BoundaryObservedAtUtc,
+        StartGameEventUid = StartGameEventUid,
+        StartGameDeliveryState = StartGameDeliveryState,
+        LastFinalResultAtUtc = LastFinalResultAtUtc,
+        AlignmentReason = AlignmentReason,
+        LastNewShoeActionId = LastNewShoeActionId,
+        LastNewShoeReason = LastNewShoeReason,
+        LastNewShoeConfirmedAtUtc = LastNewShoeConfirmedAtUtc,
+        PlayerCards = PlayerCards.Select(CloneCard).ToList(),
+        BankerCards = BankerCards.Select(CloneCard).ToList()
+    };
+
+    private static BaccaratCard CloneCard(BaccaratCard card) => new()
+    {
+        Index = card.Index,
+        Suit = card.Suit,
+        Value = card.Value,
+        IsPlayer = card.IsPlayer
+    };
 
     /// <summary>
     /// Resets simulator-only state without changing the configured shoe number.
@@ -504,7 +797,7 @@ public sealed class ShoeEndpoint
     /// <summary>
     /// Starts the next local round and clears preview cards before the betting countdown.
     /// </summary>
-    public void BeginNextRoundCountdown(bool alignShoeDateForNewRound = true)
+    public void BeginNextRoundCountdown(bool alignShoeDateForNewRound = false)
     {
         if (CurrentShoe <= 0)
         {
@@ -528,6 +821,12 @@ public sealed class ShoeEndpoint
         CurrentRoundId = CurrentRound;
         _roundInProgress = true;
         _roundSettled = false;
+        RoundPhase = BridgeRoundPhases.AwaitingSynchronization;
+        BoundaryStrategy = BridgeBoundaryStrategies.DisabledUntilValidated;
+        BoundaryObservedAtUtc = null;
+        StartGameEventUid = null;
+        StartGameDeliveryState = string.Empty;
+        AlignmentReason = string.Empty;
         PlayerCards.Clear();
         BankerCards.Clear();
         GameResultText = string.Empty;
@@ -575,18 +874,28 @@ public sealed class ShoeEndpoint
         StatusText = message;
         LastEventAt = DateTime.Now;
         LastEventText = message;
-
-        if (message.Contains("待機狀態") || message.Contains("通訊啟動"))
+        if (message.Contains("已斷線", StringComparison.Ordinal) ||
+            message.Contains("讀取錯誤", StringComparison.Ordinal) ||
+            message.Contains("連線已關閉", StringComparison.Ordinal))
         {
-            ClearPreview();
+            IsConnected = false;
         }
 
         LogReceived?.Invoke(this, "SYS", message);
         RaiseStateChanged();
     }
 
+    private void HandleTransportStateChanged(SerialListener.TransportState state)
+    {
+        IsConnected = state.Kind == SerialListener.TransportStateKind.Connected;
+        TransportStateChanged?.Invoke(this, state);
+        RaiseStateChanged();
+    }
+
     private void HandleCardDrawn(SerialListener.CardInfo card)
     {
+        LastCardAtUtc = DateTimeOffset.UtcNow;
+
         // 'R' (Retransmission)：Overdraw 清錯後指定用於「下一局」的牌（規格 §11.vi）。
         // 不計入當前局牌面，也不觸發新局推進；僅記錄狀態並送出 CardDrawn 事件供 Outbox 記錄。
         if (card.EventCode == 'R')
@@ -623,6 +932,41 @@ public sealed class ShoeEndpoint
 
         if (card.Target == "Player" && card.Index == 1)
         {
+            BaccaratCard? existingPlayerOne =
+                PlayerCards.FirstOrDefault(existing => existing.Index == 1);
+            if (existingPlayerOne != null &&
+                string.Equals(existingPlayerOne.Suit, card.Suit, StringComparison.Ordinal) &&
+                string.Equals(existingPlayerOne.Value, card.Value, StringComparison.Ordinal))
+            {
+                LastEventText =
+                    $"Duplicate card Player #1 {card.Suit} {card.Value} (state unchanged)";
+                LogReceived?.Invoke(
+                    this,
+                    "SYS",
+                    "重啟或重連後收到相同 Player #1；保留既有權威牌面，不重建本局。");
+                RaiseStateChanged();
+                return;
+            }
+
+            bool armedRoundAlreadyHasCards =
+                StartGameEventUid.HasValue &&
+                RoundPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing &&
+                (PlayerCards.Count > 0 || BankerCards.Count > 0);
+            if (armedRoundAlreadyHasCards)
+            {
+                MarkAlignmentRequired(
+                    "Conflicting Player #1 arrived after authoritative cards were already retained.");
+                LastEventText =
+                    $"Conflicting card Player #1 {card.Suit} {card.Value} (retained cards preserved)";
+                LogReceived?.Invoke(
+                    this,
+                    "ERR",
+                    "已保留牌面的進行局收到不同 Player #1；未清除舊牌，轉人工對齊。");
+                CardDrawn?.Invoke(this, card);
+                RaiseStateChanged();
+                return;
+            }
+
             PlayerCards.Clear();
             BankerCards.Clear();
             GameResultText = string.Empty;
@@ -633,7 +977,35 @@ public sealed class ShoeEndpoint
         if (card.Target == "Player" || card.Target == "Banker")
         {
             List<BaccaratCard> cards = card.Target == "Player" ? PlayerCards : BankerCards;
-            cards.RemoveAll(c => c.Index == card.Index);
+            BaccaratCard? existing = cards.FirstOrDefault(candidate => candidate.Index == card.Index);
+            if (existing != null)
+            {
+                if (string.Equals(existing.Suit, card.Suit, StringComparison.Ordinal) &&
+                    string.Equals(existing.Value, card.Value, StringComparison.Ordinal))
+                {
+                    LastEventText =
+                        $"Duplicate card {card.Target} #{card.Index} {card.Suit} {card.Value} (state unchanged)";
+                    LogReceived?.Invoke(
+                        this,
+                        "SYS",
+                        $"收到相同 {card.Target} #{card.Index} 重複牌訊；保留既有權威牌面。");
+                    RaiseStateChanged();
+                    return;
+                }
+
+                MarkAlignmentRequired(
+                    $"Conflicting {card.Target} #{card.Index} arrived for an occupied card position.");
+                LastEventText =
+                    $"Conflicting card {card.Target} #{card.Index} {card.Suit} {card.Value} (retained card preserved)";
+                LogReceived?.Invoke(
+                    this,
+                    "ERR",
+                    $"{card.Target} #{card.Index} 已有不同牌值；未覆寫舊牌，轉人工對齊。");
+                CardDrawn?.Invoke(this, card);
+                RaiseStateChanged();
+                return;
+            }
+
             cards.Add(new BaccaratCard
             {
                 Index = card.Index,
@@ -768,6 +1140,11 @@ public sealed class ShoeEndpoint
             CurrentShoe = BridgeGameNumbering.TodayFirstShoe();
         }
 
+        if (!AutoAdvanceRoundFromEvents)
+        {
+            return;
+        }
+
         bool startsRound = card.Target == "Player" && card.Index == 1;
         if (startsRound && (!_roundInProgress || _roundSettled || CurrentRound <= 0))
         {
@@ -784,6 +1161,11 @@ public sealed class ShoeEndpoint
         if (CurrentShoe <= 0)
         {
             CurrentShoe = BridgeGameNumbering.TodayFirstShoe();
+        }
+
+        if (!AutoAdvanceRoundFromEvents)
+        {
+            return;
         }
 
         if (CurrentRound <= 0)
@@ -816,4 +1198,79 @@ public sealed class ShoeEndpoint
             _ => $"Non-game status {card.Target} #{card.Index}"
         };
     }
+}
+
+/// <summary>Durable physical-round phases shared by the Worker state store and endpoint.</summary>
+public static class BridgeRoundPhases
+{
+    public const string AwaitingSynchronization = "AwaitingSynchronization";
+    public const string ConnectedWaitingBoundary = "ConnectedWaitingBoundary";
+    public const string Countdown = "Countdown";
+    public const string Dealing = "Dealing";
+    public const string WaitingForRoundBoundary = "WaitingForRoundBoundary";
+    public const string AlignmentRequired = "AlignmentRequired";
+    public const string ShoeChangePending = "ShoeChangePending";
+    public const string Cancelled = "Cancelled";
+
+    private static readonly HashSet<string> Known =
+    [
+        AwaitingSynchronization,
+        ConnectedWaitingBoundary,
+        Countdown,
+        Dealing,
+        WaitingForRoundBoundary,
+        AlignmentRequired,
+        ShoeChangePending,
+        Cancelled
+    ];
+
+    public static string Normalize(string? value) =>
+        !string.IsNullOrWhiteSpace(value) && Known.Contains(value.Trim())
+            ? value.Trim()
+            : AlignmentRequired;
+}
+
+/// <summary>Configured source of a legally armed physical-round boundary.</summary>
+public static class BridgeBoundaryStrategies
+{
+    public const string DisabledUntilValidated = "DisabledUntilValidated";
+    public const string VerifiedDeviceSignal = "VerifiedDeviceSignal";
+    public const string DerivedAfterPreviousResult = "DerivedAfterPreviousResult";
+
+    public static string Normalize(string? value) => value?.Trim() switch
+    {
+        VerifiedDeviceSignal => VerifiedDeviceSignal,
+        DerivedAfterPreviousResult => DerivedAfterPreviousResult,
+        _ => DisabledUntilValidated
+    };
+}
+
+/// <summary>Deep-copyable runtime state persisted by the headless Worker.</summary>
+public sealed record ShoeRuntimeState
+{
+    public bool ShoeEnding { get; init; }
+
+    public string RoundPhase { get; init; } = BridgeRoundPhases.AlignmentRequired;
+
+    public string BoundaryStrategy { get; init; } = BridgeBoundaryStrategies.DisabledUntilValidated;
+
+    public DateTimeOffset? BoundaryObservedAtUtc { get; init; }
+
+    public Guid? StartGameEventUid { get; init; }
+
+    public string StartGameDeliveryState { get; init; } = string.Empty;
+
+    public DateTimeOffset? LastFinalResultAtUtc { get; init; }
+
+    public string AlignmentReason { get; init; } = string.Empty;
+
+    public string LastNewShoeActionId { get; init; } = string.Empty;
+
+    public string LastNewShoeReason { get; init; } = string.Empty;
+
+    public DateTimeOffset? LastNewShoeConfirmedAtUtc { get; init; }
+
+    public List<BaccaratCard> PlayerCards { get; init; } = [];
+
+    public List<BaccaratCard> BankerCards { get; init; } = [];
 }

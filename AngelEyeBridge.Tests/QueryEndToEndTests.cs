@@ -21,8 +21,16 @@ public sealed class QueryEndToEndTests : IDisposable
     {
         const long shoe = 202607232359;
         long resultId = await _journal.AppendAsync(Payload("StartGame", shoe, 1, "2026-07-23T23:59:58Z", new { }));
-        await _journal.AppendAsync(Payload("CardDrawn", shoe, 1, "2026-07-23T23:59:59Z", new { target = "Player", value = "8" }));
+        await _journal.AppendAsync(Payload(
+            "CardDrawn",
+            shoe,
+            1,
+            "2026-07-23T23:59:59Z",
+            new { eventCode = "D", accepted = true, target = "Player", index = 1, suit = "Spade", value = "8" }));
         resultId = await _journal.AppendAsync(Payload("GameResult", shoe, 1, "2026-07-24T00:00:02Z", new { result = "Player" }));
+        Assert.True(await _journal.TryClaimForDeliveryAsync(
+            resultId,
+            new DateTime(2026, 7, 24, 0, 0, 3, DateTimeKind.Utc)));
         await _journal.MarkFailedAsync(resultId, 1, new DateTime(2026, 7, 24, 0, 0, 3, DateTimeKind.Utc), "503 retry", 503);
         await _journal.AppendAsync(Payload("StartGame", shoe, 2, "2026-07-24T00:01:00Z", new { }));
         await _journal.RecordRecoveryRequestAsync(new BridgeRecoveryAudit(

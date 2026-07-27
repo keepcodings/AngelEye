@@ -22,8 +22,8 @@ public sealed class BridgeRoundProjectionTests : IDisposable
         BridgeEventJournal journal = new(_dbPath);
         long shoe = 202607230001;
         await journal.AppendAsync(Payload("StartGame", shoe, 93, "2026-07-22T15:59:58Z", new { startTime = "2026-07-22T15:59:58Z" }));
-        await journal.AppendAsync(Payload("CardDrawn", shoe, 93, "2026-07-22T15:59:59Z", new { target = "Player", index = 1, suit = "Spade", value = "8" }));
-        await journal.AppendAsync(Payload("CardDrawn", shoe, 93, "2026-07-22T16:00:02Z", new { target = "Banker", index = 1, suit = "Heart", value = "K" }));
+        await journal.AppendAsync(Payload("CardDrawn", shoe, 93, "2026-07-22T15:59:59Z", new { eventCode = "D", accepted = true, target = "Player", index = 1, suit = "Spade", value = "8" }));
+        await journal.AppendAsync(Payload("CardDrawn", shoe, 93, "2026-07-22T16:00:02Z", new { eventCode = "D", accepted = true, target = "Banker", index = 1, suit = "Heart", value = "K" }));
         await journal.AppendAsync(Payload("GameResult", shoe, 93, "2026-07-22T16:00:10Z", new { result = "Player", pair = "None" }));
 
         using SqliteConnection connection = Open();
@@ -53,7 +53,7 @@ public sealed class BridgeRoundProjectionTests : IDisposable
     public async Task CardWithoutResult_RemainsQueryableAndIncomplete()
     {
         BridgeEventJournal journal = new(_dbPath);
-        await journal.AppendAsync(Payload("CardDrawn", 202607230001, 94, "2026-07-23T01:00:00Z", new { target = "Player", index = 1, suit = "Club", value = "2" }));
+        await journal.AppendAsync(Payload("CardDrawn", 202607230001, 94, "2026-07-23T01:00:00Z", new { eventCode = "D", accepted = true, target = "Player", index = 1, suit = "Club", value = "2" }));
 
         using SqliteConnection connection = Open();
         using SqliteCommand command = connection.CreateCommand();

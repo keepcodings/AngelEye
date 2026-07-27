@@ -16,36 +16,37 @@ public sealed class BridgeDeliveryAttemptTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessAndFailure_AreAuditedInOrder_WithSecretsRedacted()
+    public async Task FailureAndSeparateSuccess_AreAuditedInOrder_WithSecretsRedacted()
     {
         BridgeEventJournal journal = new(_dbPath);
-        long eventId = await journal.AppendAsync(Payload());
+        long failedEventId = await journal.AppendAsync(Payload());
         DateTime failedAt = new(2026, 7, 23, 2, 0, 0, DateTimeKind.Utc);
         const string jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.signature";
+        Assert.True(await journal.TryClaimForDeliveryAsync(failedEventId, failedAt));
         await journal.MarkFailedAsync(
-            eventId,
+            failedEventId,
             retryCount: 1,
             failedAt,
             $"503 upstream Authorization: Bearer secret-token jwt={jwt} signingKey=top-secret",
             httpStatus: 503);
-        await journal.MarkSentAsync(eventId, failedAt.AddSeconds(2), httpStatus: 200);
+        long sentEventId = await journal.AppendAsync(Payload());
+        Assert.True(await journal.TryClaimForDeliveryAsync(sentEventId, failedAt.AddSeconds(2)));
+        await journal.MarkSentAsync(sentEventId, failedAt.AddSeconds(2), httpStatus: 200);
 
         using SqliteConnection connection = Open();
         using SqliteCommand query = connection.CreateCommand();
         query.CommandText = """
             SELECT succeeded, http_status, retry_count, next_retry_utc, error
             FROM bridge_delivery_attempts
-            WHERE event_id = $event_id
             ORDER BY attempt_id;
             """;
-        query.Parameters.AddWithValue("$event_id", eventId);
         using SqliteDataReader reader = query.ExecuteReader();
 
         Assert.True(reader.Read());
         Assert.Equal(0, reader.GetInt32(0));
         Assert.Equal(503, reader.GetInt32(1));
         Assert.Equal(1, reader.GetInt32(2));
-        Assert.False(reader.IsDBNull(3));
+        Assert.True(reader.IsDBNull(3));
         string error = reader.GetString(4);
         Assert.DoesNotContain("secret-token", error, StringComparison.Ordinal);
         Assert.DoesNotContain(jwt, error, StringComparison.Ordinal);
@@ -55,19 +56,19 @@ public sealed class BridgeDeliveryAttemptTests : IDisposable
         Assert.True(reader.Read());
         Assert.Equal(1, reader.GetInt32(0));
         Assert.Equal(200, reader.GetInt32(1));
-        Assert.Equal(1, reader.GetInt32(2));
+        Assert.Equal(0, reader.GetInt32(2));
         Assert.True(reader.IsDBNull(3));
         Assert.True(reader.IsDBNull(4));
         Assert.False(reader.Read());
 
         using SqliteCommand current = connection.CreateCommand();
         current.CommandText = "SELECT status, retry_count, last_error FROM bridge_events WHERE event_id = $event_id;";
-        current.Parameters.AddWithValue("$event_id", eventId);
+        current.Parameters.AddWithValue("$event_id", failedEventId);
         using SqliteDataReader currentReader = current.ExecuteReader();
         Assert.True(currentReader.Read());
-        Assert.Equal("Sent", currentReader.GetString(0));
+        Assert.Equal("Failed", currentReader.GetString(0));
         Assert.Equal(1, currentReader.GetInt32(1));
-        Assert.True(currentReader.IsDBNull(2));
+        Assert.False(currentReader.IsDBNull(2));
     }
 
     public void Dispose()

@@ -19,6 +19,7 @@ public sealed class AngelEyeFrameDecoder
     public event Action<bool>? LockStatusChanged;
     public event Action<int, string>? ErrorCleared;
     public event Action<string>? StatusChanged;
+    public event Action<SerialListener.ProtocolSignal>? ProtocolSignalObserved;
     public event Action<string, string>? Diagnostic;
     public event Action<SerialListener.SerialCommandResult>? CommandAcknowledged;
 
@@ -176,9 +177,17 @@ public sealed class AngelEyeFrameDecoder
         switch ((char)data[0])
         {
             case 'S':
+                ProtocolSignalObserved?.Invoke(new SerialListener.ProtocolSignal(
+                    SerialListener.ProtocolSignalKind.StartOfCommunication,
+                    sequenceText,
+                    rawHex));
                 StatusChanged?.Invoke("通訊啟動 (Start of Communication)");
                 break;
             case 'P':
+                ProtocolSignalObserved?.Invoke(new SerialListener.ProtocolSignal(
+                    SerialListener.ProtocolSignalKind.StandBy,
+                    sequenceText,
+                    rawHex));
                 StatusChanged?.Invoke("待機狀態 (Stand By)");
                 break;
             case 'C':
@@ -303,6 +312,18 @@ public sealed class AngelEyeFrameDecoder
             >= 2 and <= 10 => valueBits.ToString(),
             _ => "None"
         };
+
+        if (eventCode is 'D' or 'R' &&
+            target is "Player" or "Banker" &&
+            (index is < 1 or > 3 ||
+             suit == "None" ||
+             value == "None"))
+        {
+            Diagnostic?.Invoke(
+                "SYS",
+                $"Malformed {eventCode} card payload rejected: target={target}, index={index}, suit={suit}, value={value}.");
+            return;
+        }
 
         CardDrawn?.Invoke(new SerialListener.CardInfo
         {

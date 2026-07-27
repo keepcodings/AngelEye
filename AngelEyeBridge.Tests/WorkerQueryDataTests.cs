@@ -140,6 +140,9 @@ public sealed class WorkerQueryDataTests : IDisposable
         await AddRoundAsync(1, "2026-07-23T00:00:00Z", settled: true, includeSecret: true);
         await AddRoundAsync(2, "2026-07-23T01:00:00Z", settled: false, includeSecret: false);
         long failedResult = await AddRoundAsync(3, "2026-07-23T02:00:00Z", settled: true, includeSecret: false);
+        Assert.True(await _journal.TryClaimForDeliveryAsync(
+            failedResult,
+            new DateTime(2026, 7, 23, 2, 0, 20, DateTimeKind.Utc)));
         await _journal.MarkFailedAsync(failedResult, 1, new DateTime(2026, 7, 23, 2, 0, 20, DateTimeKind.Utc), "503 unavailable", 503);
         await _journal.RecordRecoveryRequestAsync(new BridgeRecoveryAudit(
             "recover-2", "RecoverRound", "901", "901", Shoe, 2, 2,
@@ -151,7 +154,7 @@ public sealed class WorkerQueryDataTests : IDisposable
     private async Task<long> AddRoundAsync(int round, string start, bool settled, bool includeSecret)
     {
         await _journal.AppendAsync(Payload("StartGame", round, start, new { startTime = start }));
-        Dictionary<string, object?> card = Payload("CardDrawn", round, DateTimeOffset.Parse(start).AddSeconds(2).ToString("o"), new { target = "Player", index = 1, suit = "Spade", value = "8" });
+        Dictionary<string, object?> card = Payload("CardDrawn", round, DateTimeOffset.Parse(start).AddSeconds(2).ToString("o"), new { eventCode = "D", accepted = true, target = "Player", index = 1, suit = "Spade", value = "8" });
         if (includeSecret)
         {
             card["jwtSigningKey"] = "top-secret";

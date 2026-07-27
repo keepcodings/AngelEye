@@ -5,6 +5,122 @@ namespace AngelEyeBridge.Tests;
 
 public sealed class WorkerSettingsIdentityTests
 {
+    [Fact]
+    public void BridgeDefaults_DoNotStartRoundFromTransportConnection()
+    {
+        BridgeWorkerSettings settings = new();
+
+        Assert.False(settings.AutoStartRoundOnConnect);
+        Assert.False(settings.AutoStartNextRoundAfterResult);
+    }
+
+    [Fact]
+    public void Validate_RejectsLegacyJwtSigningMode_WhenBmsTransmissionIsEnabled()
+    {
+        WorkerSettings settings = ValidSettings();
+        settings.Shoes[0].BmsTransmitEnabled = true;
+        settings.Bms.AutoGenerateJwt = true;
+        settings.Bms.JwtSigningKey = "REPLACE_WITH_QA_SOURCE_PROVIDER_SIGNING_KEY";
+        settings.Normalize(Path.GetTempPath());
+
+        InvalidOperationException exception =
+            Assert.Throws<InvalidOperationException>(() => settings.Validate());
+
+        Assert.Contains("JwtSigningKey", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsConfiguredSigningKey_EvenWhenAutoGenerateIsFalse()
+    {
+        WorkerSettings settings = ValidSettings();
+        settings.Shoes[0].BmsTransmitEnabled = true;
+        settings.Bms.AutoGenerateJwt = false;
+        settings.Bms.JwtSigningKey = "legacy-shared-signing-key";
+        settings.Bms.ClientId = "angel-qa-29";
+        settings.Bms.ClientSecret = "client-secret";
+        settings.Normalize(Path.GetTempPath());
+
+        InvalidOperationException exception =
+            Assert.Throws<InvalidOperationException>(() => settings.Validate());
+
+        Assert.Contains("JwtSigningKey", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RequiresClientCredentials_WhenBmsTransmissionIsEnabled()
+    {
+        WorkerSettings settings = ValidSettings();
+        settings.Shoes[0].BmsTransmitEnabled = true;
+        settings.Bms.AutoGenerateJwt = false;
+        settings.Bms.JwtSigningKey = string.Empty;
+        settings.Bms.ClientId = string.Empty;
+        settings.Bms.ClientSecret = string.Empty;
+        settings.Normalize(Path.GetTempPath());
+
+        InvalidOperationException exception =
+            Assert.Throws<InvalidOperationException>(() => settings.Validate());
+
+        Assert.Contains("ClientId", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("ClientSecret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsLegacyFixedToken_WhenBmsTransmissionIsEnabled()
+    {
+        WorkerSettings settings = ValidSettings();
+        settings.Shoes[0].BmsTransmitEnabled = true;
+        settings.Bms.Token = "legacy-fixed-token";
+        settings.Bms.ClientId = "angel-qa-29";
+        settings.Bms.ClientSecret = "client-secret";
+        settings.Normalize(Path.GetTempPath());
+
+        InvalidOperationException exception =
+            Assert.Throws<InvalidOperationException>(() => settings.Validate());
+
+        Assert.Contains("Token", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_AcceptsClientCredentials_WhenBmsTransmissionIsEnabled()
+    {
+        WorkerSettings settings = ValidSettings();
+        settings.Shoes[0].BmsTransmitEnabled = true;
+        settings.Bms.AutoGenerateJwt = false;
+        settings.Bms.JwtSigningKey = string.Empty;
+        settings.Bms.ClientId = "angel-qa-29";
+        settings.Bms.ClientSecret = "client-secret";
+        settings.Normalize(Path.GetTempPath());
+
+        settings.Validate();
+    }
+
+    [Theory]
+    [InlineData("http://bms.test/api/source/angel/events")]
+    [InlineData("bms.test/api/source/angel/events")]
+    public void Validate_RejectsNonHttpsBmsUrl(string eventApiUrl)
+    {
+        WorkerSettings settings = ValidSettings();
+        settings.Bms.EventApiUrl = eventApiUrl;
+        settings.Normalize(Path.GetTempPath());
+
+        InvalidOperationException exception =
+            Assert.Throws<InvalidOperationException>(() => settings.Validate());
+
+        Assert.Contains("HTTPS", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_AllowsMissingBmsSecret_WhenEveryEndpointIsLocalOnly()
+    {
+        WorkerSettings settings = ValidSettings();
+        settings.Shoes[0].BmsTransmitEnabled = false;
+        settings.Bms.AutoGenerateJwt = true;
+        settings.Bms.JwtSigningKey = string.Empty;
+        settings.Normalize(Path.GetTempPath());
+
+        settings.Validate();
+    }
+
     [Theory]
     [InlineData("", "QA", "Primary")]
     [InlineData("telebet-29", "", "Primary")]

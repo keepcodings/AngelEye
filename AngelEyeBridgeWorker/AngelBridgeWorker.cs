@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -17,15 +18,18 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private readonly BridgeEventJournal _journal;
     private readonly WorkerStateStore _stateStore;
     private readonly BmsApiClient _bmsApiClient = new();
+    private BmsClientCredentialsAccessTokenProvider? _bmsAccessTokenProvider;
     private readonly List<ShoeEndpoint> _endpoints;
     private readonly ConcurrentDictionary<string, BridgeOutboxStatus> _outboxStatuses = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _createdStartGames = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _creatingStartGames = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _publishedStartGames = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _handledBmsCommandIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ShoeEndpoint, CancellationTokenSource> _pendingNextRoundCountdowns = [];
-    private readonly RecoverRoundBackoffTracker _recoverRoundBackoff = new();
     private readonly WorkerHttpRouter _httpRouter;
     private readonly object _roundGate = new();
     private readonly object _commandGate = new();
+    private readonly SemaphoreSlim _rawFrameGate = new(1, 1);
     private long _eventSequence;
     private Task? _reconnectTask;
     private Task? _statusTask;
@@ -48,9 +52,16 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
 
         _journal = new BridgeEventJournal(settings.Bridge.DatabasePath);
-        _endpoints = settings.Shoes.Select(shoe => new ShoeEndpoint(shoe)).ToList();
+        _endpoints = settings.Shoes
+            .Select(shoe => new ShoeEndpoint(shoe)
+            {
+                AutoAdvanceRoundFromEvents = false
+            })
+            .ToList();
         foreach (ShoeEndpoint endpoint in _endpoints)
         {
+            _stateStore.Apply(endpoint);
+            RestoreStartGameTracking(endpoint);
             RegisterEndpoint(endpoint);
         }
 
@@ -115,12 +126,16 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             cts.Cancel();
         }
 
-        foreach (CancellationTokenSource pending in _pendingNextRoundCountdowns.Values)
+        CancellationTokenSource[] pendingCountdowns;
+        lock (_roundGate)
+        {
+            pendingCountdowns = _pendingNextRoundCountdowns.Values.ToArray();
+            _pendingNextRoundCountdowns.Clear();
+        }
+        foreach (CancellationTokenSource pending in pendingCountdowns)
         {
             pending.Cancel();
-            pending.Dispose();
         }
-        _pendingNextRoundCountdowns.Clear();
 
         foreach (Task? task in new[] { _reconnectTask, _statusTask, _healthTask })
         {
@@ -162,31 +177,94 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     {
         await StopAsync().ConfigureAwait(false);
         _bmsApiClient.Dispose();
+        _bmsAccessTokenProvider?.Dispose();
+        _bmsAccessTokenProvider = null;
         _runCts?.Dispose();
     }
 
     private void RegisterEndpoint(ShoeEndpoint endpoint)
     {
-        endpoint.LogReceived += (shoe, type, data) => Log(shoe, type, data);
-        endpoint.CardDrawn += EndpointCardDrawn;
-        endpoint.GameResultReceived += EndpointGameResultReceived;
-        endpoint.ErrorOccurred += EndpointErrorOccurred;
-        endpoint.LockStatusChanged += EndpointLockStatusChanged;
-        endpoint.ErrorCleared += EndpointErrorCleared;
-        endpoint.CuttingCardDrawn += EndpointCuttingCardDrawn;
+        endpoint.Listener.RawFrameAdmission =
+            bytes => PersistRawFrame(endpoint, bytes.Span);
+        endpoint.LogReceived += (shoe, type, data) =>
+        {
+            Log(shoe, type, data);
+        };
+        endpoint.ProtocolSignalObserved += (shoe, signal) =>
+            RunSerializedEndpointEvent(shoe, () =>
+            {
+                Log(
+                    shoe,
+                    "PROTOCOL",
+                    $"{signal.Kind} seq={signal.Sequence}; diagnostic only, round state unchanged.");
+                return Task.CompletedTask;
+            });
+        endpoint.TransportStateChanged += (shoe, state) =>
+            RunSerializedEndpointEvent(
+                shoe,
+                () => EndpointTransportStateChangedAsync(shoe, state));
+        endpoint.CardDrawn += (shoe, card) =>
+            RunSerializedEndpointEvent(shoe, () => EndpointCardDrawnAsync(shoe, card));
+        endpoint.GameResultReceived += (shoe, result) =>
+            RunSerializedEndpointEvent(shoe, () => EndpointGameResultReceivedAsync(shoe, result));
+        endpoint.ErrorOccurred += (shoe, error) =>
+            RunSerializedEndpointEvent(shoe, () => EndpointErrorOccurredAsync(shoe, error));
+        endpoint.LockStatusChanged += (shoe, isLocked) =>
+            RunSerializedEndpointEvent(shoe, () => EndpointLockStatusChangedAsync(shoe, isLocked));
+        endpoint.ErrorCleared += (shoe, code, message) =>
+            RunSerializedEndpointEvent(shoe, () => EndpointErrorClearedAsync(shoe, code, message));
+        endpoint.CuttingCardDrawn += (shoe, cutCard) =>
+            RunSerializedEndpointEvent(shoe, () => EndpointCuttingCardDrawnAsync(shoe, cutCard));
     }
 
-    private async Task ConnectAllAsync(CancellationToken cancellationToken)
+    private void RunSerializedEndpointEvent(
+        ShoeEndpoint endpoint,
+        Func<Task> handler)
+    {
+        endpoint.ExecuteSerializedStateTransition(() =>
+        {
+            try
+            {
+                handler().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                CancelPendingNextRound(endpoint);
+                endpoint.MarkAlignmentRequired(
+                    $"Serialized endpoint event failed: {ex.GetType().Name}.");
+                TrySaveFailClosedState(endpoint);
+                Log(endpoint, "ERR", $"Serialized endpoint event failed: {ex.Message}");
+            }
+        });
+    }
+
+    private Task EndpointTransportStateChangedAsync(
+        ShoeEndpoint endpoint,
+        SerialListener.TransportState state)
+    {
+        if (state.Kind is not (
+                SerialListener.TransportStateKind.RemoteClosed or
+                SerialListener.TransportStateKind.ReadError))
+        {
+            return Task.CompletedTask;
+        }
+
+        CancelPendingNextRound(endpoint);
+        endpoint.MarkAlignmentRequired(
+            $"Transport {state.Kind}; round continuity cannot be proven.");
+        _stateStore.Save(endpoint);
+        return Task.CompletedTask;
+    }
+
+    private Task ConnectAllAsync(CancellationToken cancellationToken)
     {
         foreach (ShoeEndpoint endpoint in _endpoints.Where(static e => e.Enabled))
         {
             cancellationToken.ThrowIfCancellationRequested();
             TryConnect(endpoint);
-            if (endpoint.IsConnected && _settings.Bridge.AutoStartRoundOnConnect)
-            {
-                await BeginInitialRoundAsync(endpoint).ConfigureAwait(false);
-            }
         }
+
+        return Task.CompletedTask;
     }
 
     private void TryConnect(ShoeEndpoint endpoint)
@@ -198,9 +276,12 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
         try
         {
-            endpoint.Connect();
-            _stateStore.Save(endpoint);
-            Log(endpoint, "SYS", $"Connected {endpoint.ConnectionDisplay}");
+            endpoint.ExecuteSerializedStateTransition(() =>
+            {
+                endpoint.Connect();
+                _stateStore.Save(endpoint);
+                Log(endpoint, "SYS", $"Connected {endpoint.ConnectionDisplay}");
+            });
         }
         catch (Exception ex)
         {
@@ -233,76 +314,55 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
     private void StartBmsDispatcher()
     {
-        string token = ResolveBmsToken();
-        BmsApiSettings apiSettings = new(_settings.Bms.EventApiUrl, token);
+        BmsApiSettings apiSettings = new(
+            _settings.Bms.EventApiUrl,
+            string.Empty,
+            _settings.Bridge.BridgeId,
+            _settings.Bridge.BridgeName,
+            _settings.Bridge.EnvironmentName);
+        BmsClientCredentialsAccessTokenProvider accessTokenProvider = new(
+            _settings.Bms.EventApiUrl,
+            _settings.Bms.ClientId,
+            _settings.Bms.ClientSecret,
+            _settings.Bridge.BridgeId);
+        _bmsAccessTokenProvider = accessTokenProvider;
         _bmsApiClient.OnLogReceived += message => Log("API", message);
         _bmsApiClient.OnStatusChanged += status => Log("API", $"BMS dispatcher: {status}");
-        _bmsApiClient.Start(
-            apiSettings,
-            _journal,
-            IsEventDispatchEnabled,
-            BuildHeartbeatSnapshot,
-            HandleBmsCommandAsync);
+        try
+        {
+            _bmsApiClient.Start(
+                apiSettings,
+                _journal,
+                IsEventDispatchEnabled,
+                BuildHeartbeatSnapshot,
+                HandleBmsCommandAsync,
+                accessTokenProvider: accessTokenProvider);
+        }
+        catch
+        {
+            _bmsAccessTokenProvider = null;
+            accessTokenProvider.Dispose();
+            throw;
+        }
     }
 
-    private string ResolveBmsToken()
-    {
-        if (!_settings.Bms.AutoGenerateJwt)
-        {
-            return _settings.Bms.Token;
-        }
-
-        return JwtTokenGenerator.GenerateSourceProviderToken(
-            _settings.Bms.JwtNameIdentifier,
-            _settings.Bms.JwtSerialNumber,
-            _settings.Bms.JwtIssuer,
-            _settings.Bms.JwtAudience,
-            _settings.Bms.JwtSigningKey,
-            _settings.Bms.JwtLifetimeMinutes);
-    }
-
-    private async Task BeginInitialRoundAsync(ShoeEndpoint endpoint)
-    {
-        if (!endpoint.IsConnected || endpoint.ShoeEnding)
-        {
-            return;
-        }
-
-        // Do not create yesterday's StartGame merely because the worker restarted
-        // after midnight.  The next card tells us whether an old game is continuing
-        // (for example Banker #1 after Player #1 at 23:59) or Player #1 is a new game.
-        if (endpoint.CurrentShoe > 0 && !BridgeGameNumbering.IsShoeForDate(endpoint.CurrentShoe, DateTime.Now))
-        {
-            Log(endpoint, "SYS", $"跨日啟動，保留 {endpoint.CurrentShoe}/{endpoint.CurrentRound} 並等待下一筆牌訊判定是否為新局。");
-            return;
-        }
-
-        await BeginRoundCountdownAsync(endpoint, DateTimeOffset.UtcNow, endpoint.CurrentRound > 0 ? "啟動時延續當前局" : "啟動時建立第一局").ConfigureAwait(false);
-    }
-
-    private async Task BeginRoundCountdownAsync(ShoeEndpoint endpoint, DateTimeOffset startedAtUtc, string reason)
-    {
-        lock (_roundGate)
-        {
-            long targetRound = endpoint.CurrentRound > 0 ? endpoint.CurrentRound : 1;
-            endpoint.SetGameNumber(endpoint.CurrentShoe, Math.Max(targetRound - 1, 0));
-            endpoint.BeginNextRoundCountdown();
-            endpoint.StartBetCountdown(startedAtUtc, endpoint.TotalBetTimeSeconds);
-        }
-
-        Log(endpoint, "SYS", $"{reason}: {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
-        _stateStore.Save(endpoint);
-        await PublishStartGameIfNeededAsync(endpoint, startedAtUtc).ConfigureAwait(false);
-    }
-
-    private async void EndpointCardDrawn(ShoeEndpoint endpoint, SerialListener.CardInfo card)
+    private async Task EndpointCardDrawnAsync(ShoeEndpoint endpoint, SerialListener.CardInfo card)
     {
         try
         {
-            if (card.EventCode != 'R' && card.Target == "Player" && card.Index == 1)
+            if (card.EventCode != 'R' && IsBaccaratCardForBms(card))
             {
                 CancelPendingNextRound(endpoint);
-                await PublishStartGameIfNeededAsync(endpoint).ConfigureAwait(false);
+                if (!HasCreatedStartGame(endpoint))
+                {
+                    endpoint.MarkAlignmentRequired(
+                        $"Physical card arrived before a durable StartGame for {endpoint.CurrentShoe}/{endpoint.CurrentRound}.");
+                    Log(endpoint, "SYS", $"牌訊早於合法 StartGame；本局 {endpoint.CurrentShoe}/{endpoint.CurrentRound} 僅保留本機，不補造開局。");
+                }
+                else
+                {
+                    endpoint.MarkDealing();
+                }
             }
 
             _stateStore.Save(endpoint);
@@ -315,47 +375,131 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
             await PublishBridgeEventAsync("CardDrawn", endpoint, new
             {
+                eventCode = card.EventCode.ToString(),
+                accepted = IsAuthoritativeBaccaratCard(endpoint, card),
                 target = card.Target,
                 index = card.Index,
                 suit = card.Suit,
-                value = card.Value
+                value = card.Value,
+                protocolSequence = card.Seq,
+                rawBytes = card.RawBytes
             }).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
+            endpoint.MarkAlignmentRequired($"Card persistence failed: {ex.GetType().Name}.");
+            TrySaveFailClosedState(endpoint);
             Log(endpoint, "ERR", $"CardDrawn handling failed: {ex.Message}");
         }
     }
 
-    private async void EndpointGameResultReceived(ShoeEndpoint endpoint, SerialListener.GameResult result)
+    private async Task EndpointGameResultReceivedAsync(ShoeEndpoint endpoint, SerialListener.GameResult result)
     {
         try
         {
+            DateTimeOffset sourceTimestamp = DateTimeOffset.UtcNow;
+            bool roundWasLegallyArmed =
+                HasCreatedStartGame(endpoint) &&
+                endpoint.RoundPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing;
+            lock (_roundGate)
+            {
+                _publishedStartGames.Remove(BuildRoundKey(endpoint));
+            }
+            bool hasDeliverableStartGame = await _journal
+                .HasDeliverableStartGameAsync(
+                    endpoint.SourceDataCode,
+                    endpoint.DeviceId,
+                    endpoint.CurrentShoe,
+                    endpoint.CurrentRound,
+                    endpoint.CurrentRoundId)
+                .ConfigureAwait(false);
+            bool isDeliverableResult = IsDeliverableGameResult(result.Result);
+            string p1 = ToBmsCard(endpoint.PlayerCards, 1);
+            string p2 = ToBmsCard(endpoint.PlayerCards, 2);
+            string p3 = ToBmsCard(endpoint.PlayerCards, 3);
+            string b1 = ToBmsCard(endpoint.BankerCards, 1);
+            string b2 = ToBmsCard(endpoint.BankerCards, 2);
+            string b3 = ToBmsCard(endpoint.BankerCards, 3);
+            bool hasMandatoryCards =
+                HasMandatoryBaccaratCards(p1, p2, b1, b2);
+            Guid? gameResultEventUid = endpoint.StartGameEventUid.HasValue
+                ? DeriveGameResultEventUid(endpoint.StartGameEventUid.Value)
+                : null;
+            bool allowBmsDelivery =
+                roundWasLegallyArmed &&
+                hasDeliverableStartGame &&
+                isDeliverableResult &&
+                hasMandatoryCards;
             Log(endpoint, "EVENT", $"GameResult {endpoint.CurrentShoe}/{endpoint.CurrentRound} {result.Result} / {result.Pair}");
-            _stateStore.Save(endpoint);
             await PublishBridgeEventAsync("GameResult", endpoint, new
             {
                 result = result.Result,
-                pair = result.Pair
-            }).ConfigureAwait(false);
-
-            if (_settings.Bridge.AutoStartNextRoundAfterResult && !endpoint.ShoeEnding)
+                pair = result.Pair,
+                status = string.Equals(result.Result, "ForceQuit", StringComparison.OrdinalIgnoreCase)
+                    ? "Cancelled"
+                    : IsNormalBaccaratResult(result.Result) ? "Normal" : "Unknown",
+                sourceTimestamp = sourceTimestamp.ToString("o", CultureInfo.InvariantCulture),
+                cards = new
+                {
+                    p1,
+                    p2,
+                    p3,
+                    b1,
+                    b2,
+                    b3
+                }
+            }, rootFields =>
             {
-                ScheduleNextRoundCountdownAfterResult(endpoint);
+                if (gameResultEventUid.HasValue)
+                {
+                    rootFields["eventUid"] = gameResultEventUid.Value;
+                }
+            }, allowBmsDelivery: allowBmsDelivery).ConfigureAwait(false);
+
+            endpoint.MarkFinalResultStored(sourceTimestamp, result.Result);
+            if (!hasMandatoryCards)
+            {
+                endpoint.MarkAlignmentRequired(
+                    "Final result is missing one or more mandatory cards (p1, p2, b1, b2).");
+            }
+            _stateStore.Save(endpoint);
+
+            if (!allowBmsDelivery)
+            {
+                string reason = !roundWasLegallyArmed
+                    ? "本機 round phase 未合法 armed"
+                    : !hasDeliverableStartGame
+                        ? "無已登記 StartGame"
+                        : !isDeliverableResult
+                            ? $"結果 {result.Result} 不可作正常賽果"
+                            : "缺少必要牌面 p1/p2/b1/b2";
+                Log(endpoint, "API", $"GameResult {endpoint.CurrentShoe}/{endpoint.CurrentRound} {reason}，僅保留本機。");
+            }
+
+            if (_settings.Bridge.AutoStartNextRoundAfterResult &&
+                IsNormalBaccaratResult(result.Result) &&
+                hasMandatoryCards &&
+                !endpoint.ShoeEnding &&
+                endpoint.RoundPhase == BridgeRoundPhases.WaitingForRoundBoundary)
+            {
+                ScheduleNextRoundCountdownAfterResult(endpoint, sourceTimestamp);
             }
         }
         catch (Exception ex)
         {
+            endpoint.MarkAlignmentRequired($"GameResult persistence failed: {ex.GetType().Name}.");
+            TrySaveFailClosedState(endpoint);
             Log(endpoint, "ERR", $"GameResult handling failed: {ex.Message}");
         }
     }
 
-    private async void EndpointCuttingCardDrawn(ShoeEndpoint endpoint, SerialListener.CutCardInfo cutCard)
+    private async Task EndpointCuttingCardDrawnAsync(ShoeEndpoint endpoint, SerialListener.CutCardInfo cutCard)
     {
         try
         {
             CancelPendingNextRound(endpoint);
             Log(endpoint, "EVENT", $"CutCardDrawn {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
+            endpoint.MarkShoeChangePending();
             _stateStore.Save(endpoint);
             await PublishBridgeEventAsync("CutCardDrawn", endpoint, new
             {
@@ -365,31 +509,38 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            endpoint.MarkAlignmentRequired($"Cut-card persistence failed: {ex.GetType().Name}.");
+            TrySaveFailClosedState(endpoint);
             Log(endpoint, "ERR", $"CutCard handling failed: {ex.Message}");
         }
     }
 
-    private async void EndpointErrorOccurred(ShoeEndpoint endpoint, SerialListener.ErrorInfo error)
+    private async Task EndpointErrorOccurredAsync(ShoeEndpoint endpoint, SerialListener.ErrorInfo error)
     {
         try
         {
             CancelPendingNextRound(endpoint);
             Log(endpoint, "EVENT", $"Error [{error.ErrorCode}] {error.ErrorMessage}");
+            endpoint.MarkAlignmentRequired($"Shoe protocol error {error.ErrorCode}.");
             _stateStore.Save(endpoint);
             await PublishBridgeEventAsync("Error", endpoint, new
             {
                 errorCode = error.ErrorCode,
                 errorMessage = error.ErrorMessage,
-                inErrorMode = error.InErrorMode
+                inErrorMode = error.InErrorMode,
+                protocolSequence = error.Seq,
+                rawBytes = error.RawBytes
             }).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
+            endpoint.MarkAlignmentRequired($"Error persistence failed: {ex.GetType().Name}.");
+            TrySaveFailClosedState(endpoint);
             Log(endpoint, "ERR", $"Error handling failed: {ex.Message}");
         }
     }
 
-    private async void EndpointLockStatusChanged(ShoeEndpoint endpoint, bool isLocked)
+    private async Task EndpointLockStatusChangedAsync(ShoeEndpoint endpoint, bool isLocked)
     {
         try
         {
@@ -402,7 +553,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
     }
 
-    private async void EndpointErrorCleared(ShoeEndpoint endpoint, int errorCode, string errorMessage)
+    private async Task EndpointErrorClearedAsync(ShoeEndpoint endpoint, int errorCode, string errorMessage)
     {
         try
         {
@@ -419,11 +570,16 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         }
     }
 
-    private void ScheduleNextRoundCountdownAfterResult(ShoeEndpoint endpoint)
+    private void ScheduleNextRoundCountdownAfterResult(
+        ShoeEndpoint endpoint,
+        DateTimeOffset resultObservedAtUtc)
     {
         CancelPendingNextRound(endpoint);
         CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(_runCts?.Token ?? CancellationToken.None);
-        _pendingNextRoundCountdowns[endpoint] = cts;
+        lock (_roundGate)
+        {
+            _pendingNextRoundCountdowns[endpoint] = cts;
+        }
         _ = Task.Run(async () =>
         {
             try
@@ -431,94 +587,283 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                 int delaySeconds = _settings.Bridge.ResultToNextRoundDelaySeconds;
                 Log(endpoint, "SYS", $"結算後 {delaySeconds} 秒自動進入下一局倒數。");
                 await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cts.Token).ConfigureAwait(false);
-                if (!endpoint.IsConnected || endpoint.InErrorMode || endpoint.ShoeEnding)
+                DateTimeOffset boundaryAtUtc = DateTimeOffset.UtcNow;
+                RunSerializedEndpointEvent(endpoint, async () =>
                 {
-                    return;
-                }
+                    lock (_roundGate)
+                    {
+                        if (!_pendingNextRoundCountdowns.TryGetValue(
+                                endpoint,
+                                out CancellationTokenSource? current) ||
+                            !ReferenceEquals(current, cts) ||
+                            cts.IsCancellationRequested)
+                        {
+                            return;
+                        }
 
-                lock (_roundGate)
-                {
+                        _pendingNextRoundCountdowns.Remove(endpoint);
+                    }
+
+                    bool cardArrivedBeforeBoundary =
+                        endpoint.LastCardAtUtc.HasValue &&
+                        endpoint.LastCardAtUtc.Value > resultObservedAtUtc;
+                    if (!endpoint.IsConnected ||
+                        endpoint.InErrorMode ||
+                        endpoint.ShoeEnding ||
+                        cardArrivedBeforeBoundary ||
+                        endpoint.RoundPhase != BridgeRoundPhases.WaitingForRoundBoundary ||
+                        endpoint.LastFinalResultAtUtc != resultObservedAtUtc)
+                    {
+                        return;
+                    }
+
+                    long previousShoe = endpoint.CurrentShoe;
+                    long previousRound = endpoint.CurrentRound;
                     endpoint.BeginNextRoundCountdown();
-                    endpoint.StartBetCountdown(DateTimeOffset.UtcNow, endpoint.TotalBetTimeSeconds);
-                }
+                    bool started =
+                        endpoint.CurrentShoe != previousShoe ||
+                        endpoint.CurrentRound != previousRound;
+                    if (!started)
+                    {
+                        Log(endpoint, "SYS", "下一局 boundary 未推進靴局，取消 StartGame。");
+                        return;
+                    }
 
-                _stateStore.Save(endpoint);
-                await PublishStartGameIfNeededAsync(endpoint).ConfigureAwait(false);
+                    endpoint.ArmRoundBoundary(
+                        BridgeBoundaryStrategies.DerivedAfterPreviousResult,
+                        boundaryAtUtc,
+                        Guid.NewGuid());
+                    endpoint.StartBetCountdown(boundaryAtUtc, endpoint.TotalBetTimeSeconds);
+                    _stateStore.Save(endpoint);
+                    await PublishStartGameIfNeededAsync(endpoint, boundaryAtUtc).ConfigureAwait(false);
+                });
             }
             catch (OperationCanceledException)
             {
             }
             catch (Exception ex)
             {
+                endpoint.MarkAlignmentRequired($"Derived boundary failed: {ex.GetType().Name}.");
+                TrySaveFailClosedState(endpoint);
                 Log(endpoint, "ERR", $"Next round schedule failed: {ex.Message}");
             }
             finally
             {
-                if (_pendingNextRoundCountdowns.Remove(endpoint))
+                lock (_roundGate)
                 {
-                    cts.Dispose();
+                    if (_pendingNextRoundCountdowns.TryGetValue(endpoint, out CancellationTokenSource? current) &&
+                        ReferenceEquals(current, cts))
+                    {
+                        _pendingNextRoundCountdowns.Remove(endpoint);
+                    }
                 }
+                cts.Dispose();
             }
         });
     }
 
     private void CancelPendingNextRound(ShoeEndpoint endpoint)
     {
-        if (_pendingNextRoundCountdowns.Remove(endpoint, out CancellationTokenSource? pending))
+        CancellationTokenSource? pending;
+        lock (_roundGate)
         {
-            pending.Cancel();
-            pending.Dispose();
+            _pendingNextRoundCountdowns.Remove(endpoint, out pending);
         }
+        pending?.Cancel();
     }
 
     private async Task<bool> PublishStartGameIfNeededAsync(ShoeEndpoint endpoint, DateTimeOffset? startTimeOverride = null)
     {
-        string key = $"{endpoint.SourceDataCode}:{endpoint.CurrentShoe}:{endpoint.CurrentRound}";
+        string key = BuildRoundKey(endpoint);
         lock (_roundGate)
         {
-            if (_publishedStartGames.Contains(key))
+            if (_createdStartGames.Contains(key) || _creatingStartGames.Contains(key))
             {
-                return true;
+                return _publishedStartGames.Contains(key);
             }
+
+            if (!endpoint.StartGameEventUid.HasValue ||
+                endpoint.StartGameEventUid.Value == Guid.Empty ||
+                endpoint.RoundPhase != BridgeRoundPhases.Countdown)
+            {
+                endpoint.MarkAlignmentRequired(
+                    "StartGame cannot be created without a durable trusted boundary identity.");
+                _stateStore.Save(endpoint);
+                return false;
+            }
+
+            _creatingStartGames.Add(key);
         }
 
-        int totalBetTime = endpoint.TotalBetTimeSeconds;
-        DateTimeOffset startTime = startTimeOverride ?? DateTimeOffset.UtcNow;
-        bool queued = await PublishBridgeEventAsync("StartGame", endpoint, new
+        try
         {
-            totalBetTime,
-            startTime = startTime.ToString("o", CultureInfo.InvariantCulture),
-            bootId = endpoint.CurrentShoe.ToString(CultureInfo.InvariantCulture),
-            groupId = 1
-        }, rootFields =>
-        {
-            rootFields["totalBetTime"] = totalBetTime;
-            rootFields["startTime"] = startTime.ToString("o", CultureInfo.InvariantCulture);
-        }).ConfigureAwait(false);
+            int totalBetTime = endpoint.TotalBetTimeSeconds;
+            DateTimeOffset startTime = startTimeOverride ?? DateTimeOffset.UtcNow;
+            Guid eventUid = endpoint.StartGameEventUid.Value;
+            bool queued = await PublishBridgeEventAsync("StartGame", endpoint, new
+            {
+                totalBetTime,
+                startTime = startTime.ToString("o", CultureInfo.InvariantCulture),
+                bootId = endpoint.CurrentShoe.ToString(CultureInfo.InvariantCulture),
+                groupId = 1
+            }, rootFields =>
+            {
+                rootFields["eventUid"] = eventUid;
+                rootFields["totalBetTime"] = totalBetTime;
+                rootFields["startTime"] = startTime.ToString("o", CultureInfo.InvariantCulture);
+            }, allowBmsDelivery: true).ConfigureAwait(false);
 
-        if (queued)
+            endpoint.MarkStartGameStored(queued ? "Pending" : "LocalOnly");
+            _stateStore.Save(endpoint);
+            lock (_roundGate)
+            {
+                _createdStartGames.Add(key);
+                if (queued)
+                {
+                    _publishedStartGames.Add(key);
+                }
+            }
+
+            if (queued)
+            {
+                Log(endpoint, "EVENT", $"StartGame {endpoint.CurrentShoe}/{endpoint.CurrentRound} TotalBetTime={totalBetTime}");
+            }
+            else
+            {
+                Log(endpoint, "API", $"StartGame {endpoint.CurrentShoe}/{endpoint.CurrentRound} 僅保留本機，未進入 BMS outbox。");
+            }
+
+            return queued;
+        }
+        finally
         {
             lock (_roundGate)
             {
-                _publishedStartGames.Add(key);
+                _creatingStartGames.Remove(key);
             }
-
-            Log(endpoint, "EVENT", $"StartGame {endpoint.CurrentShoe}/{endpoint.CurrentRound} TotalBetTime={totalBetTime}");
         }
-
-        return queued;
     }
 
-    internal async Task<bool> PublishBridgeEventAsync(string type, ShoeEndpoint endpoint, object data, Action<Dictionary<string, object?>>? configureRoot = null)
+    private string BuildRoundKey(ShoeEndpoint endpoint) =>
+        $"{endpoint.SourceDataCode}:{endpoint.CurrentShoe}:{endpoint.CurrentRound}";
+
+    private bool HasPublishedStartGame(ShoeEndpoint endpoint)
     {
-        if (!IsAuthorizedBmsSender(endpoint))
+        lock (_roundGate)
         {
-            Log(endpoint, "API", $"BMS 傳送已關閉，略過 {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
+            return _publishedStartGames.Contains(BuildRoundKey(endpoint));
+        }
+    }
+
+    private bool HasCreatedStartGame(ShoeEndpoint endpoint)
+    {
+        if (endpoint.RoundPhase is not (BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing))
+        {
             return false;
         }
 
+        lock (_roundGate)
+        {
+            return _createdStartGames.Contains(BuildRoundKey(endpoint));
+        }
+    }
+
+    private void RestoreStartGameTracking(ShoeEndpoint endpoint)
+    {
+        if (!endpoint.StartGameEventUid.HasValue ||
+            endpoint.StartGameEventUid.Value == Guid.Empty ||
+            string.IsNullOrWhiteSpace(endpoint.StartGameDeliveryState) ||
+            string.Equals(endpoint.StartGameDeliveryState, "Prepared", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        string key = BuildRoundKey(endpoint);
+        lock (_roundGate)
+        {
+            _createdStartGames.Add(key);
+            if (endpoint.StartGameDeliveryState is not ("LocalOnly" or "Rejected" or "UnregisteredSkipped"))
+            {
+                _publishedStartGames.Add(key);
+            }
+        }
+    }
+
+    private bool PersistRawFrame(ShoeEndpoint endpoint, ReadOnlySpan<byte> rawBytes)
+    {
+        try
+        {
+            if (rawBytes.IsEmpty)
+            {
+                return true;
+            }
+
+            string rawHex = BitConverter
+                .ToString(rawBytes.ToArray())
+                .Replace("-", " ", StringComparison.Ordinal);
+            _rawFrameGate.Wait();
+            try
+            {
+                _journal
+                    .AppendRawFrameAsync(
+                        endpoint.SourceDataCode,
+                        endpoint.DeviceId,
+                        endpoint.CurrentShoe,
+                        endpoint.CurrentRound,
+                        endpoint.CurrentRoundId,
+                        "RX",
+                        rawHex,
+                        DateTimeOffset.UtcNow)
+                    .GetAwaiter()
+                    .GetResult();
+            }
+            finally
+            {
+                _rawFrameGate.Release();
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            endpoint.ExecuteSerializedStateTransition(() =>
+            {
+                CancelPendingNextRound(endpoint);
+                endpoint.MarkAlignmentRequired($"Raw frame persistence failed: {ex.GetType().Name}.");
+                TrySaveFailClosedState(endpoint);
+                Log(endpoint, "ERR", $"Raw frame persistence failed: {ex.Message}");
+            });
+            return false;
+        }
+    }
+
+    private void TrySaveFailClosedState(ShoeEndpoint endpoint)
+    {
+        try
+        {
+            _stateStore.Save(endpoint);
+        }
+        catch (Exception stateException)
+        {
+            Log(endpoint, "ERR", $"Fail-closed state persistence failed: {stateException.Message}");
+        }
+    }
+
+    internal async Task<bool> PublishBridgeEventAsync(
+        string type,
+        ShoeEndpoint endpoint,
+        object data,
+        Action<Dictionary<string, object?>>? configureRoot = null,
+        bool allowBmsDelivery = false)
+    {
+        bool queueForDelivery =
+            allowBmsDelivery &&
+            type is "StartGame" or "GameResult" &&
+            IsAuthorizedBmsSender(endpoint);
+
         Dictionary<string, object?> payload = new()
         {
+            ["bridgeId"] = _settings.Bridge.BridgeId,
             ["type"] = type,
             ["source"] = AngelEyeProtocol.SourceName,
             ["sequence"] = Interlocked.Increment(ref _eventSequence),
@@ -553,10 +898,11 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             payload["moxaPort"] = endpoint.MoxaPort;
         }
 
-        long eventId = await _journal.AppendAsync(payload).ConfigureAwait(false);
-        Log(endpoint, "API", $"Outbox queued #{eventId} {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
+        long eventId = await _journal.AppendAsync(payload, queueForDelivery).ConfigureAwait(false);
+        string disposition = queueForDelivery ? "Outbox queued" : "Local stored";
+        Log(endpoint, "API", $"{disposition} #{eventId} {type} {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
         _ = RefreshOutboxStatusesAsync();
-        return true;
+        return queueForDelivery;
     }
 
     private static string ResolveEventState(string type) => type switch
@@ -574,6 +920,96 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private static bool IsBaccaratCardForBms(SerialListener.CardInfo card)
     {
         return card.Target == "Player" || card.Target == "Banker";
+    }
+
+    private static bool IsAuthoritativeBaccaratCard(
+        ShoeEndpoint endpoint,
+        SerialListener.CardInfo card)
+    {
+        if (card.EventCode != 'D' ||
+            card.Target is not ("Player" or "Banker") ||
+            card.Index is < 1 or > 3)
+        {
+            return false;
+        }
+
+        IReadOnlyList<BaccaratCard> cards =
+            card.Target == "Player" ? endpoint.PlayerCards : endpoint.BankerCards;
+        BaccaratCard? retained = cards.FirstOrDefault(
+            candidate => candidate.Index == card.Index);
+        return retained is not null &&
+            string.Equals(retained.Suit, card.Suit, StringComparison.Ordinal) &&
+            string.Equals(retained.Value, card.Value, StringComparison.Ordinal);
+    }
+
+    private static bool IsDeliverableGameResult(string result) =>
+        IsNormalBaccaratResult(result);
+
+    private static bool HasMandatoryBaccaratCards(
+        string p1,
+        string p2,
+        string b1,
+        string b2) =>
+        !string.IsNullOrWhiteSpace(p1) &&
+        !string.IsNullOrWhiteSpace(p2) &&
+        !string.IsNullOrWhiteSpace(b1) &&
+        !string.IsNullOrWhiteSpace(b2);
+
+    internal static Guid DeriveGameResultEventUid(Guid startGameEventUid)
+    {
+        if (startGameEventUid == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "StartGame eventUid must not be empty.",
+                nameof(startGameEventUid));
+        }
+
+        byte[] identity = Encoding.UTF8.GetBytes(
+            $"ANGEL/GameResult/{startGameEventUid:D}");
+        byte[] digest = SHA256.HashData(identity);
+        Guid result = new(digest.AsSpan(0, 16));
+        if (result == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                "Derived GameResult eventUid must not be empty.");
+        }
+
+        return result;
+    }
+
+    private static bool IsNormalBaccaratResult(string result) =>
+        string.Equals(result, "PlayerWin", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(result, "BankerWin", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(result, "Tie", StringComparison.OrdinalIgnoreCase);
+
+    internal static string ToBmsCard(IEnumerable<BaccaratCard> cards, int index)
+    {
+        BaccaratCard? card = cards.FirstOrDefault(candidate => candidate.Index == index);
+        if (card is null)
+        {
+            return string.Empty;
+        }
+
+        string rank = card.Value.Trim().ToUpperInvariant() switch
+        {
+            "1" => "A",
+            "11" => "J",
+            "12" => "Q",
+            "13" => "K",
+            string value => value
+        };
+        string suit = card.Suit.Trim() switch
+        {
+            "Spade" or "Spades" or "s" or "S" => "s",
+            "Heart" or "Hearts" or "h" or "H" => "h",
+            "Diamond" or "Diamonds" or "d" or "D" => "d",
+            "Club" or "Clubs" or "c" or "C" => "c",
+            _ => string.Empty
+        };
+
+        return string.IsNullOrWhiteSpace(rank) || string.IsNullOrWhiteSpace(suit)
+            ? string.Empty
+            : $"{rank}{suit}";
     }
 
     private IReadOnlyList<AngelBridgeHeartbeatEndpointStatus> BuildHeartbeatSnapshot()
@@ -651,8 +1087,9 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             string type = command.Type.Trim();
             result = type switch
             {
-                "RecoverRound" => await HandleRecoverRoundCommandAsync(command, cancellationToken).ConfigureAwait(false),
-                "ResendEvent" => await HandleResendEventCommandAsync(command, cancellationToken).ConfigureAwait(false),
+                "RecoverRound" or "ResendEvent" => BridgeCommandHandlingResult.Rejected(
+                    "Legacy recovery replay through the live /events outbox is disabled; " +
+                    "command-authorized recovery requires the dedicated /recoveries flow."),
                 _ => BridgeCommandHandlingResult.Rejected($"Unsupported command type: {command.Type}")
             };
         }
@@ -681,17 +1118,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             "Handled" when result.Message.StartsWith("Requeued", StringComparison.OrdinalIgnoreCase) => "Requeued",
             _ => result.Status
         };
-        DateTimeOffset? nextRetryUtc = null;
-        if (string.Equals(command.Type, "RecoverRound", StringComparison.Ordinal) &&
-            auditResult is "Backoff" or "NotFound")
-        {
-            RecoverRoundBackoffDecision decision = _recoverRoundBackoff.GetDecision(command, observedAt);
-            if (!decision.ShouldAttempt)
-            {
-                nextRetryUtc = observedAt.Add(decision.Delay);
-            }
-        }
-
         string commandId = string.IsNullOrWhiteSpace(command.CommandId)
             ? $"local-{Guid.NewGuid():N}"
             : command.CommandId;
@@ -706,177 +1132,8 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             observedAt,
             DateTimeOffset.UtcNow,
             auditResult,
-            nextRetryUtc,
-            result.Message)).ConfigureAwait(false);
-    }
-
-    private async Task<BridgeCommandHandlingResult> HandleRecoverRoundCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (!command.Shoe.HasValue || !command.Round.HasValue)
-        {
-            return BridgeCommandHandlingResult.Rejected("RecoverRound requires shoe and round.");
-        }
-
-        ShoeEndpoint? endpoint = FindEndpointForCommand(command);
-        if (endpoint == null)
-        {
-            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found or was ambiguous.");
-        }
-
-        if (!IsAuthorizedBmsSender(endpoint))
-        {
-            return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
-        }
-
-        RecoverRoundBackoffDecision backoffDecision = _recoverRoundBackoff.GetDecision(command, DateTimeOffset.UtcNow);
-        if (!backoffDecision.ShouldAttempt)
-        {
-            return BridgeCommandHandlingResult.Deferred(
-                $"GameResult {command.Shoe}/{command.Round} was not found locally; retry after {FormatRetryDelay(backoffDecision.Delay)}.");
-        }
-
-        BridgeEventQuery query = new()
-        {
-            Type = "GameResult",
-            SourceDataCode = endpoint.SourceDataCode,
-            DeviceId = endpoint.DeviceId,
-            Shoe = command.Shoe,
-            Round = command.Round,
-            RoundId = command.RoundId,
-            Limit = 1
-        };
-
-        int count = await _journal
-            .RequeueMatchingEventsAsync(query, DateTime.UtcNow, $"BMS command {command.CommandId} RecoverRound")
-            .ConfigureAwait(false);
-        if (count <= 0)
-        {
-            RecoverRoundBackoffDecision retryDecision = _recoverRoundBackoff.RecordNotFound(command, DateTimeOffset.UtcNow);
-            Log(endpoint, "API", $"BMS 補償要求找不到 GameResult {command.Shoe}/{command.Round}，{FormatRetryDelay(retryDecision.Delay)} 後重試。");
-            return BridgeCommandHandlingResult.NotFound($"GameResult {command.Shoe}/{command.Round} was not found locally.");
-        }
-
-        _recoverRoundBackoff.Clear(command);
-        Log(endpoint, "API", $"BMS 補償要求已重新排送 GameResult {command.Shoe}/{command.Round}。");
-        _ = RefreshOutboxStatusesAsync();
-        return BridgeCommandHandlingResult.Handled($"Requeued {count} GameResult event(s).");
-    }
-
-    private static string FormatRetryDelay(TimeSpan delay)
-    {
-        int seconds = Math.Max(1, (int)Math.Ceiling(delay.TotalSeconds));
-        return $"{seconds.ToString(CultureInfo.InvariantCulture)} 秒";
-    }
-
-    private async Task<BridgeCommandHandlingResult> HandleResendEventCommandAsync(AngelBridgeCommand command, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (command.EventId.HasValue)
-        {
-            BridgeStoredEventIdentity? identity = await _journal
-                .GetEventIdentityAsync(command.EventId.Value)
-                .ConfigureAwait(false);
-            if (identity == null)
-            {
-                return BridgeCommandHandlingResult.NotFound($"EventId {command.EventId.Value} was not found locally.");
-            }
-
-            // Event-ID resend authorization is based on the immutable identity stored with the
-            // event. Command-supplied desk/device fields must never redirect an event to another desk.
-            ShoeEndpoint? storedEndpoint = FindEndpointForStoredEvent(identity);
-            if (storedEndpoint == null)
-            {
-                return BridgeCommandHandlingResult.NotFound(
-                    $"EventId {command.EventId.Value} endpoint was not found or was ambiguous.");
-            }
-
-            if (!IsAuthorizedBmsSender(storedEndpoint))
-            {
-                return BridgeCommandHandlingResult.Rejected(
-                    $"EventId {command.EventId.Value} endpoint has BMS transmission disabled.");
-            }
-
-            int requeuedById = await _journal
-                .RequeueEventAsync(command.EventId.Value, DateTime.UtcNow, $"BMS command {command.CommandId} ResendEvent")
-                .ConfigureAwait(false);
-            if (requeuedById <= 0)
-            {
-                return BridgeCommandHandlingResult.NotFound($"EventId {command.EventId.Value} was not found locally.");
-            }
-
-            Log(storedEndpoint, "API", $"BMS 要求重送事件 #{command.EventId.Value}，已重新排送。");
-            _ = RefreshOutboxStatusesAsync();
-            return BridgeCommandHandlingResult.Handled($"Requeued event #{command.EventId.Value}.");
-        }
-
-        ShoeEndpoint? endpoint = FindEndpointForCommand(command);
-        if (endpoint == null)
-        {
-            return BridgeCommandHandlingResult.NotFound("Target endpoint was not found or was ambiguous.");
-        }
-
-        if (!IsAuthorizedBmsSender(endpoint))
-        {
-            return BridgeCommandHandlingResult.Rejected("Target endpoint has BMS transmission disabled.");
-        }
-
-        if (string.IsNullOrWhiteSpace(command.EventType) && (!command.Shoe.HasValue || !command.Round.HasValue))
-        {
-            return BridgeCommandHandlingResult.Rejected("ResendEvent requires eventId or eventType with shoe and round.");
-        }
-
-        BridgeEventQuery query = new()
-        {
-            Type = command.EventType,
-            SourceDataCode = endpoint.SourceDataCode,
-            DeviceId = endpoint.DeviceId,
-            Shoe = command.Shoe,
-            Round = command.Round,
-            RoundId = command.RoundId,
-            Limit = 20
-        };
-
-        int requeuedCount = await _journal
-            .RequeueMatchingEventsAsync(query, DateTime.UtcNow, $"BMS command {command.CommandId} ResendEvent")
-            .ConfigureAwait(false);
-        if (requeuedCount <= 0)
-        {
-            return BridgeCommandHandlingResult.NotFound("No matching local events were found.");
-        }
-
-        Log(endpoint, "API", $"BMS 要求重送 {requeuedCount} 筆事件，已重新排送。");
-        _ = RefreshOutboxStatusesAsync();
-        return BridgeCommandHandlingResult.Handled($"Requeued {requeuedCount} event(s).");
-    }
-
-    private ShoeEndpoint? FindEndpointForCommand(AngelBridgeCommand command)
-    {
-        if (string.IsNullOrWhiteSpace(command.SourceDataCode) &&
-            string.IsNullOrWhiteSpace(command.DeviceId))
-        {
-            return null;
-        }
-
-        ShoeEndpoint[] matches = _endpoints.Where(endpoint =>
-            (string.IsNullOrWhiteSpace(command.SourceDataCode) ||
-                string.Equals(endpoint.SourceDataCode, command.SourceDataCode, StringComparison.OrdinalIgnoreCase)) &&
-            (string.IsNullOrWhiteSpace(command.DeviceId) ||
-                string.Equals(endpoint.DeviceId, command.DeviceId, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(endpoint.ShoeId, command.DeviceId, StringComparison.OrdinalIgnoreCase)))
-            .Take(2)
-            .ToArray();
-        return matches.Length == 1 ? matches[0] : null;
-    }
-
-    private ShoeEndpoint? FindEndpointForStoredEvent(BridgeStoredEventIdentity identity)
-    {
-        ShoeEndpoint[] matches = _endpoints.Where(endpoint =>
-                string.Equals(endpoint.SourceDataCode, identity.SourceDataCode, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(endpoint.DeviceId, identity.DeviceId, StringComparison.OrdinalIgnoreCase))
-            .Take(2)
-            .ToArray();
-        return matches.Length == 1 ? matches[0] : null;
+            NextRetryUtc: null,
+            Message: result.Message)).ConfigureAwait(false);
     }
 
     internal bool IsEventDispatchEnabled(BridgePendingEvent pending)

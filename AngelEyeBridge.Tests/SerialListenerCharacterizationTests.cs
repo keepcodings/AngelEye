@@ -130,6 +130,52 @@ public sealed class SerialListenerCharacterizationTests
             message.Contains("duplicate", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public void InjectBytes_WhenRawAdmissionFails_DoesNotDecodeTranslatedEvent()
+    {
+        var listener = new SerialListener();
+        var cardCount = 0;
+        listener.RawFrameAdmission = _ => false;
+        listener.OnCardDrawn += _ => cardCount++;
+
+        listener.InjectBytes(BuildActiveReport('B', (byte)'D', 0x81, 0xB8));
+
+        Assert.Equal(0, cardCount);
+    }
+
+    [Fact]
+    public void InjectBytes_EmitsTypedStartAndStandBySignals()
+    {
+        var listener = new SerialListener();
+        var observed = new List<SerialListener.ProtocolSignal>();
+        listener.OnProtocolSignalObserved += observed.Add;
+
+        listener.InjectBytes(BuildActiveReport('C', (byte)'S'));
+        listener.InjectBytes(BuildActiveReport('D', (byte)'P'));
+
+        Assert.Collection(
+            observed,
+            signal => Assert.Equal(
+                SerialListener.ProtocolSignalKind.StartOfCommunication,
+                signal.Kind),
+            signal => Assert.Equal(
+                SerialListener.ProtocolSignalKind.StandBy,
+                signal.Kind));
+    }
+
+    [Fact]
+    public void InjectBytes_RejectsMalformedBaccaratCardPayload()
+    {
+        var listener = new SerialListener();
+        var cardCount = 0;
+        listener.OnCardDrawn += _ => cardCount++;
+
+        listener.InjectBytes(BuildActiveReport('E', (byte)'D', 0x80, 0xB8));
+        listener.InjectBytes(BuildActiveReport('F', (byte)'D', 0x81, 0x08));
+
+        Assert.Equal(0, cardCount);
+    }
+
     private static byte[] BuildActiveReport(char sequence, params byte[] data)
     {
         var packetWithoutBcc = new byte[data.Length + 3];

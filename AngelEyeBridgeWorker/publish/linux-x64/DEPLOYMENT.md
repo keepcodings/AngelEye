@@ -234,7 +234,7 @@ sudo systemctl start angel-eye-bridge
 - `appsettings.server-30.production.example.json`：`10.5.32.30` 正式主機；送往 `redhood67.infinitybeyonder888.com`。包含 901 / 902 / 903。
 - `appsettings.server-31.standby.example.json`：`10.5.32.31` 正式備援；設定與正式主機相同，但 systemd 平時必須保持停止與停用。
 
-正式與備援範本的 JWT Provider ID、Token Serial、Signing Key 及 SourceDataId 尚未取得，因此保留 `REPLACE_WITH_...` 或空白。部署前必須依正式 BMS 資料補齊；桌台主要對應欄位仍是 `sourceDataCode`（901 / 902 / 903）。
+QA `.29` 與正式主用 `.30` 的環境檔已依專案負責人明確核准配置各自獨立的 `clientId`／`clientSecret`，並同步納入 private Git 與 release bundle；repository 與 bundle 必須視為含密憑證限制存取，任何未授權曝光都必須輪替對應憑證。正式主用 `.30` 的 Provider 與 901／902／903 SourceDataId 已配置；正式備援 `.31` 仍保留 `REPLACE_WITH_...` 或空白，未經核准不得沿用主用 Bridge credential。不得共用 HMAC signing key、固定 token 或其他 Bridge 的 client credential；桌台主要對應欄位仍是 `sourceDataCode`（901 / 902 / 903）。
 
 目前已確認的 MOXA 對應另記錄於 `moxa-endpoints.pit9.json`：
 
@@ -336,11 +336,15 @@ sudo cp -a /var/backups/angel-eye-bridge/20260723-query-console/etc/. /etc/angel
 }
 ```
 
-`currentShoe = 0` 代表啟動時自動用當天日期產生第一靴，例如 `202606300001`。  
-`currentRound = 1` 代表啟動時從第 1 局開始送 `StartGame`。
+`currentShoe = 0` 只用於首次建立本機編號；正式部署應由已核對的 durable state 接續。
+`currentRound` 是已知局號基準，不代表啟動時要送 `StartGame`。cold start、connect、reconnect 與 BMS 恢復都不得自行開局。
 
 服務啟動後，目前靴號 / 局號會寫入 `/var/lib/angel-eye-bridge/bridge-state.json`。  
 systemd 重啟時會優先套用狀態檔，不會每次都回到 appsettings 的初始局號。
+
+Worker SQLite 不使用 EF Migration。新版程式啟動時會在 transaction 內執行相容 schema upgrade；raw frame、round phase、boundary evidence、牌面、結果與 delivery identity 任一損毀時都 fail closed。部署前必須備份 `bridge-events.sqlite` 與 `bridge-state.json`，並先以停用 BMS 傳送的設定做 config check。
+
+BMS 與 Worker 必須協調升級：先部署含 `AngelEventReceipt`／`AngelRecoveryCommand` EF Migration 與專用 client-credentials API 的 BMS，再由安全管道配置每台 Worker 的 client ID/secret，最後才更新 Worker。舊版自簽 JWT、固定 token、`AutoStartRoundOnConnect` 與 `IncrementAfterFinalResult` 語意不可繼續沿用。QA 完成設定檢查與人工 boundary 驗證前，Worker 維持停用。
 
 ## 日誌查詢
 

@@ -1,5 +1,8 @@
 using Microsoft.Data.Sqlite;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AngelEyeBmsBridge;
 
@@ -14,11 +17,30 @@ public sealed class BridgeSettings
     private const string DefaultAngelMidoriProviderId = "899e293f-cf47-46b0-bde0-2ed3c7395f17";
     private const string DefaultAngelMidoriTokenSerial = "b1b696a8-70f4-41d6-a549-bc2f4592cf6f";
     private const string SettingsKey = "bridge_settings_json";
+    private static readonly byte[] BmsClientSecretEntropy =
+        SHA256.HashData(Encoding.UTF8.GetBytes(
+            "AngelEyeBmsBridge/BmsClientSecret/DPAPI/v1"));
 
     /// <summary>BMS event API URL.</summary>
     public string BmsUrl { get; set; } = DefaultBmsUrl;
 
-    /// <summary>Current JWT bearer token used for BMS API calls.</summary>
+    /// <summary>Stable bridge identity registered for this GUI client.</summary>
+    public string BridgeId { get; set; } = Environment.MachineName;
+
+    /// <summary>Per-bridge client identifier used only at the token endpoint.</summary>
+    public string BmsClientId { get; set; } = string.Empty;
+
+    /// <summary>Per-bridge client secret used only at the token endpoint.</summary>
+    [JsonIgnore]
+    public string BmsClientSecret { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Windows DPAPI CurrentUser ciphertext for the client secret. The plaintext
+    /// property is intentionally excluded from persisted JSON.
+    /// </summary>
+    public string BmsClientSecretProtected { get; set; } = string.Empty;
+
+    /// <summary>Legacy fixed bearer token; cleared during settings normalization.</summary>
     public string BmsToken { get; set; } = string.Empty;
 
     /// <summary>JWT source provider identifier claim.</summary>
@@ -107,6 +129,7 @@ public sealed class BridgeSettings
     /// </summary>
     public void Save()
     {
+        BmsClientSecretProtected = ProtectBmsClientSecret(BmsClientSecret);
         string json = JsonSerializer.Serialize(this, JsonOptions);
         InitializeSettingsDatabase();
 
@@ -139,7 +162,7 @@ public sealed class BridgeSettings
             return null;
         }
 
-        return JsonSerializer.Deserialize<BridgeSettings>(json, JsonOptions);
+        return DeserializeSettings(json);
     }
 
     private static BridgeSettings? LoadFromLegacyJson()
@@ -150,7 +173,127 @@ public sealed class BridgeSettings
         }
 
         string json = File.ReadAllText(SettingsPath);
-        return JsonSerializer.Deserialize<BridgeSettings>(json, JsonOptions);
+        return DeserializeSettings(json);
+    }
+
+    private static BridgeSettings? DeserializeSettings(string json)
+    {
+        BridgeSettings? settings =
+            JsonSerializer.Deserialize<BridgeSettings>(json, JsonOptions);
+        if (settings == null)
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.BmsClientSecretProtected))
+        {
+            settings.BmsClientSecret = UnprotectBmsClientSecret(
+                settings.BmsClientSecretProtected);
+            return settings;
+        }
+
+        // One-time migration for an uncommitted/legacy build that may have written
+        // BmsClientSecret in plaintext. Save() immediately replaces it with DPAPI
+        // ciphertext because the plaintext property is JsonIgnored.
+        using JsonDocument document = JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            foreach (JsonProperty property in document.RootElement.EnumerateObject())
+            {
+                if (string.Equals(
+                        property.Name,
+                        nameof(BmsClientSecret),
+                        StringComparison.OrdinalIgnoreCase) &&
+                    property.Value.ValueKind == JsonValueKind.String)
+                {
+                    settings.BmsClientSecret =
+                        property.Value.GetString()?.Trim() ?? string.Empty;
+                    break;
+                }
+            }
+        }
+
+        return settings;
+    }
+
+    internal static string ProtectBmsClientSecret(string secret)
+    {
+        string normalized = secret?.Trim() ?? string.Empty;
+        if (normalized.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new PlatformNotSupportedException(
+                "GUI client credentials require Windows DPAPI.");
+        }
+
+        byte[] plaintext = Encoding.UTF8.GetBytes(normalized);
+        try
+        {
+#if WINDOWS
+            byte[] protectedBytes = ProtectedData.Protect(
+                plaintext,
+                BmsClientSecretEntropy,
+                DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(protectedBytes);
+#else
+            throw new PlatformNotSupportedException(
+                "GUI client credentials require Windows DPAPI.");
+#endif
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+        }
+    }
+
+    internal static string UnprotectBmsClientSecret(string protectedValue)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return string.Empty;
+        }
+
+        byte[] ciphertext;
+        try
+        {
+            ciphertext = Convert.FromBase64String(protectedValue.Trim());
+        }
+        catch (FormatException)
+        {
+            return string.Empty;
+        }
+
+        byte[]? plaintext = null;
+        try
+        {
+#if WINDOWS
+            plaintext = ProtectedData.Unprotect(
+                ciphertext,
+                BmsClientSecretEntropy,
+                DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(plaintext);
+#else
+            return string.Empty;
+#endif
+        }
+        catch (CryptographicException)
+        {
+            // A copied database or different Windows account cannot recover this
+            // machine/user-bound secret. Authentication remains fail closed.
+            return string.Empty;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(ciphertext);
+            if (plaintext != null)
+            {
+                CryptographicOperations.ZeroMemory(plaintext);
+            }
+        }
     }
 
     private static void InitializeSettingsDatabase()
@@ -287,6 +430,13 @@ public sealed class BridgeSettings
 
     private static void NormalizeJwtSettings(BridgeSettings settings)
     {
+        settings.BridgeId = string.IsNullOrWhiteSpace(settings.BridgeId)
+            ? Environment.MachineName
+            : settings.BridgeId.Trim();
+        settings.BmsClientId = settings.BmsClientId?.Trim() ?? string.Empty;
+        settings.BmsClientSecret = settings.BmsClientSecret?.Trim() ?? string.Empty;
+        settings.BmsToken = string.Empty;
+
         if (string.IsNullOrWhiteSpace(settings.JwtNameIdentifier))
         {
             settings.JwtNameIdentifier = DefaultAngelMidoriProviderId;
@@ -307,10 +457,9 @@ public sealed class BridgeSettings
             settings.JwtAudience = "BMS RESTful API";
         }
 
-        if (string.IsNullOrWhiteSpace(settings.JwtSigningKey))
-        {
-            settings.JwtSigningKey = DefaultSourceProviderSigningKey;
-        }
+        // Shared signing-key and fixed-token authentication are intentionally
+        // retired. Clear any legacy value rather than carrying it forward.
+        settings.JwtSigningKey = string.Empty;
 
         if (settings.JwtLifetimeMinutes <= 0)
         {
@@ -353,7 +502,8 @@ public sealed class BridgeSettings
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        WriteIndented = true
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true
     };
 }
 
