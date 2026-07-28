@@ -132,6 +132,53 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ColdStartMidRound_FromSecondCards_KeepsPartialRoundLocalAndAlignmentRequired()
+    {
+        WorkerSettings settings = CreateSettings(
+            readOnly: true,
+            healthPort: null,
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true));
+        await using AngelBridgeWorker worker = new(settings);
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint = worker.Endpoints[0];
+        long initialShoe = endpoint.CurrentShoe;
+        long initialRound = endpoint.CurrentRound;
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'D', 0x82, 0xB8));
+        endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'D', 0x92, 0x4D));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "CardDrawn") == 2,
+            cancellation.Token);
+
+        Assert.Equal(BridgeRoundPhases.AlignmentRequired, endpoint.RoundPhase);
+        Assert.Contains("before a durable StartGame", endpoint.AlignmentReason);
+        Assert.Collection(
+            endpoint.PlayerCards,
+            card => Assert.Equal(2, card.Index));
+        Assert.Collection(
+            endpoint.BankerCards,
+            card => Assert.Equal(2, card.Index));
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('3', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 1,
+            cancellation.Token);
+
+        Assert.Equal(initialShoe, endpoint.CurrentShoe);
+        Assert.Equal(initialRound, endpoint.CurrentRound);
+        Assert.Equal(BridgeRoundPhases.AlignmentRequired, endpoint.RoundPhase);
+        Assert.Equal(0, CountEvents(settings.Bridge.DatabasePath, type: "StartGame"));
+        Assert.Equal(
+            2,
+            CountEvents(settings.Bridge.DatabasePath, type: "CardDrawn", status: "LocalOnly"));
+        Assert.Equal(
+            1,
+            CountEvents(settings.Bridge.DatabasePath, type: "GameResult", status: "LocalOnly"));
+        Assert.Equal(3, CountRows(settings.Bridge.DatabasePath, "bridge_raw_frames"));
+        Assert.Empty(await worker.Journal.GetDueOutboxEventsAsync(20, DateTime.UtcNow));
+    }
+
+    [Fact]
     public async Task CutThenStartSignal_AutomaticallyChangesOnlyTheSameEndpointOnce()
     {
         WorkerSettings settings = CreateSettings(
@@ -269,6 +316,32 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
         Assert.False(worker.IsEventDispatchEnabled(Pending(2, "902", "SHOE902")));
         Assert.False(worker.IsEventDispatchEnabled(Pending(3, "903", "SHOE903")));
         Assert.False(worker.IsEventDispatchEnabled(Pending(4, "UNKNOWN", "UNKNOWN")));
+    }
+
+    [Fact]
+    public async Task BmsControlPlaneSnapshot_ExcludesLocalOnlyAndDisabledEndpoints()
+    {
+        WorkerSettings settings = CreateSettings(
+            readOnly: false,
+            healthPort: null,
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true),
+            Endpoint("ANGEL_BACQA", "SHOEQA", bmsTransmitEnabled: false),
+            Endpoint("903", "SHOE903", bmsTransmitEnabled: true, enabled: false));
+
+        await using AngelBridgeWorker worker = new(settings);
+
+        Assert.Equal(3, worker.Endpoints.Count);
+        Assert.Contains(
+            worker.Endpoints,
+            endpoint =>
+                endpoint.SourceDataCode == "ANGEL_BACQA" &&
+                endpoint.Enabled &&
+                !endpoint.BmsTransmitEnabled);
+
+        AngelBridgeHeartbeatEndpointStatus endpointStatus =
+            Assert.Single(worker.BuildHeartbeatSnapshot());
+        Assert.Equal("901", endpointStatus.SourceDataCode);
+        Assert.Equal("SHOE901", endpointStatus.DeviceId);
     }
 
     [Fact]

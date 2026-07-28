@@ -1115,34 +1115,37 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             : $"{rank}{suit}";
     }
 
-    private IReadOnlyList<AngelBridgeHeartbeatEndpointStatus> BuildHeartbeatSnapshot()
+    internal IReadOnlyList<AngelBridgeHeartbeatEndpointStatus> BuildHeartbeatSnapshot()
     {
-        return _endpoints.Select(endpoint =>
-        {
-            BridgeOutboxStatus outboxStatus = GetEndpointOutboxStatus(endpoint);
-            return new AngelBridgeHeartbeatEndpointStatus
+        return _endpoints
+            .Where(IsAuthorizedBmsSender)
+            .Select(endpoint =>
             {
-                DeskName = endpoint.DeskName,
-                SourceDataCode = endpoint.SourceDataCode,
-                SourceDataId = endpoint.SourceDataId,
-                ShoeId = endpoint.ShoeId,
-                DeviceId = endpoint.DeviceId,
-                ComPort = endpoint.ConnectionDisplay,
-                ConnectionMode = endpoint.ConnectionMode,
-                MoxaHost = endpoint.IsMoxaTcpMode ? endpoint.MoxaHost : string.Empty,
-                MoxaPort = endpoint.IsMoxaTcpMode ? endpoint.MoxaPort : null,
-                Enabled = endpoint.Enabled,
-                BmsTransmitEnabled = endpoint.BmsTransmitEnabled,
-                MockMode = endpoint.MockMode,
-                Status = endpoint.StatusText,
-                Shoe = endpoint.CurrentShoe,
-                Round = endpoint.CurrentRound,
-                RoundId = endpoint.CurrentRoundId,
-                PendingOutboxCount = outboxStatus.PendingCount,
-                FailedOutboxCount = outboxStatus.FailedCount,
-                LastEvent = endpoint.LastEventText
-            };
-        }).ToList();
+                BridgeOutboxStatus outboxStatus = GetEndpointOutboxStatus(endpoint);
+                return new AngelBridgeHeartbeatEndpointStatus
+                {
+                    DeskName = endpoint.DeskName,
+                    SourceDataCode = endpoint.SourceDataCode,
+                    SourceDataId = endpoint.SourceDataId,
+                    ShoeId = endpoint.ShoeId,
+                    DeviceId = endpoint.DeviceId,
+                    ComPort = endpoint.ConnectionDisplay,
+                    ConnectionMode = endpoint.ConnectionMode,
+                    MoxaHost = endpoint.IsMoxaTcpMode ? endpoint.MoxaHost : string.Empty,
+                    MoxaPort = endpoint.IsMoxaTcpMode ? endpoint.MoxaPort : null,
+                    Enabled = endpoint.Enabled,
+                    BmsTransmitEnabled = endpoint.BmsTransmitEnabled,
+                    MockMode = endpoint.MockMode,
+                    Status = endpoint.StatusText,
+                    Shoe = endpoint.CurrentShoe,
+                    Round = endpoint.CurrentRound,
+                    RoundId = endpoint.CurrentRoundId,
+                    PendingOutboxCount = outboxStatus.PendingCount,
+                    FailedOutboxCount = outboxStatus.FailedCount,
+                    LastEvent = endpoint.LastEventText
+                };
+            })
+            .ToList();
     }
 
     private async Task RefreshOutboxStatusesAsync()
