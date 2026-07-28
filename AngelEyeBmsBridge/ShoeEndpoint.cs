@@ -238,6 +238,12 @@ public sealed class ShoeEndpoint
     /// <summary>UTC time of the last audited new-shoe confirmation.</summary>
     public DateTimeOffset? LastNewShoeConfirmedAtUtc { get; private set; }
 
+    /// <summary>
+    /// Gets whether terminal telegrams must remain quarantined until the first
+    /// authoritative result of a newly confirmed shoe.
+    /// </summary>
+    public bool AwaitingFirstAuthoritativeResultAfterShoeChange { get; private set; }
+
     /// <summary>Gets the last shoe error code, if any.</summary>
     public int? ErrorCode { get; private set; }
 
@@ -474,6 +480,7 @@ public sealed class ShoeEndpoint
         StartGameDeliveryState = string.Empty;
         LastFinalResultAtUtc = null;
         AlignmentReason = string.Empty;
+        AwaitingFirstAuthoritativeResultAfterShoeChange = false;
         ClearBetCountdown(notify: false);
         LastEventAt = DateTime.Now;
         LastEventText = $"Game number {CurrentShoe}/{CurrentRound}";
@@ -548,8 +555,41 @@ public sealed class ShoeEndpoint
         LastNewShoeActionId = normalizedActionId;
         LastNewShoeReason = normalizedReason;
         LastNewShoeConfirmedAtUtc = DateTimeOffset.UtcNow;
+        AwaitingFirstAuthoritativeResultAfterShoeChange = false;
         RaiseStateChanged();
         return true;
+    }
+
+    /// <summary>
+    /// Completes an automatic physical shoe change only when the same endpoint
+    /// already holds durable cut-card evidence.
+    /// </summary>
+    public bool TryConfirmNewShoeFromStartSignal(
+        SerialListener.ProtocolSignal signal,
+        DateTime? now = null)
+    {
+        if (signal.Kind != SerialListener.ProtocolSignalKind.StartOfCommunication ||
+            !ShoeEnding)
+        {
+            return false;
+        }
+
+        string sequence = string.IsNullOrWhiteSpace(signal.Sequence)
+            ? "unknown"
+            : signal.Sequence.Trim();
+        string actionId =
+            $"device-c-s:{SourceDataCode}:{DeviceId}:{CurrentShoe}:{sequence}";
+        bool confirmed = ConfirmNewShoe(
+            actionId,
+            $"Card shoe StartOfCommunication sequence {sequence} followed persisted CuttingCardDrawn.",
+            now);
+        if (confirmed)
+        {
+            AwaitingFirstAuthoritativeResultAfterShoeChange = true;
+            RaiseStateChanged();
+        }
+
+        return confirmed;
     }
 
     /// <summary>
@@ -626,6 +666,8 @@ public sealed class ShoeEndpoint
         LastNewShoeActionId = state.LastNewShoeActionId?.Trim() ?? string.Empty;
         LastNewShoeReason = state.LastNewShoeReason?.Trim() ?? string.Empty;
         LastNewShoeConfirmedAtUtc = state.LastNewShoeConfirmedAtUtc;
+        AwaitingFirstAuthoritativeResultAfterShoeChange =
+            state.AwaitingFirstAuthoritativeResultAfterShoeChange;
 
         PlayerCards.Clear();
         PlayerCards.AddRange(state.PlayerCards.Select(CloneCard));
@@ -720,6 +762,12 @@ public sealed class ShoeEndpoint
             return;
         }
 
+        if (ShoeEnding)
+        {
+            RoundPhase = BridgeRoundPhases.ShoeChangePending;
+            return;
+        }
+
         if (string.Equals(result, "ForceQuit", StringComparison.OrdinalIgnoreCase))
         {
             RoundPhase = BridgeRoundPhases.Cancelled;
@@ -736,12 +784,24 @@ public sealed class ShoeEndpoint
         }
     }
 
-    /// <summary>Persists the cut-card hold until an audited new-shoe action clears it.</summary>
+    /// <summary>
+    /// Persists the cut-card hold while allowing an already armed final round to finish.
+    /// </summary>
     public void MarkShoeChangePending()
     {
         ShoeEnding = true;
-        RoundPhase = BridgeRoundPhases.ShoeChangePending;
         ClearBetCountdown(notify: false);
+        bool canFinishArmedRound =
+            StartGameEventUid.HasValue &&
+            RoundPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing;
+        if (canFinishArmedRound)
+        {
+            _roundInProgress = true;
+            _roundSettled = false;
+            return;
+        }
+
+        RoundPhase = BridgeRoundPhases.ShoeChangePending;
         _roundInProgress = false;
         _roundSettled = true;
     }
@@ -760,6 +820,8 @@ public sealed class ShoeEndpoint
         LastNewShoeActionId = LastNewShoeActionId,
         LastNewShoeReason = LastNewShoeReason,
         LastNewShoeConfirmedAtUtc = LastNewShoeConfirmedAtUtc,
+        AwaitingFirstAuthoritativeResultAfterShoeChange =
+            AwaitingFirstAuthoritativeResultAfterShoeChange,
         PlayerCards = PlayerCards.Select(CloneCard).ToList(),
         BankerCards = BankerCards.Select(CloneCard).ToList()
     };
@@ -782,6 +844,7 @@ public sealed class ShoeEndpoint
         GameResultText = string.Empty;
         GameResultColor = Color.White;
         ShoeEnding = false;
+        AwaitingFirstAuthoritativeResultAfterShoeChange = false;
         InErrorMode = false;
         ErrorCode = null;
         ErrorMessage = string.Empty;
@@ -916,7 +979,10 @@ public sealed class ShoeEndpoint
             return;
         }
 
-        if (ShoeEnding)
+        bool canFinishArmedShoeEndingRound =
+            StartGameEventUid.HasValue &&
+            RoundPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing;
+        if (ShoeEnding && !canFinishArmedShoeEndingRound)
         {
             LastEventAt = DateTime.Now;
             LastEventText = $"Ignored card after cutting card {card.Target} #{card.Index}";
@@ -1025,6 +1091,23 @@ public sealed class ShoeEndpoint
         EnsureRoundForResult();
 
         LastEventAt = DateTime.Now;
+        bool hasAuthoritativeNewShoeRound =
+            StartGameEventUid.HasValue &&
+            PlayerCards.Any(static card => card.Index == 1) &&
+            PlayerCards.Any(static card => card.Index == 2) &&
+            BankerCards.Any(static card => card.Index == 1) &&
+            BankerCards.Any(static card => card.Index == 2);
+        if (AwaitingFirstAuthoritativeResultAfterShoeChange &&
+            !hasAuthoritativeNewShoeRound)
+        {
+            LastEventText =
+                $"Quarantined result after shoe change {result.Result} / {result.Pair}";
+            GameResultReceived?.Invoke(this, result);
+            RaiseStateChanged();
+            return;
+        }
+
+        AwaitingFirstAuthoritativeResultAfterShoeChange = false;
         LastEventText = $"Result {result.Result} / {result.Pair}";
 
         (GameResultText, GameResultColor) = result.Result switch
@@ -1093,7 +1176,7 @@ public sealed class ShoeEndpoint
     {
         LastEventAt = DateTime.Now;
         LastEventText = "Cutting card drawn";
-        ShoeEnding = true;
+        MarkShoeChangePending();
         CuttingCardDrawn?.Invoke(this, cutCard);
         RaiseStateChanged();
     }
@@ -1269,6 +1352,8 @@ public sealed record ShoeRuntimeState
     public string LastNewShoeReason { get; init; } = string.Empty;
 
     public DateTimeOffset? LastNewShoeConfirmedAtUtc { get; init; }
+
+    public bool AwaitingFirstAuthoritativeResultAfterShoeChange { get; init; }
 
     public List<BaccaratCard> PlayerCards { get; init; } = [];
 

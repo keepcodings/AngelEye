@@ -277,6 +277,85 @@ public sealed class WorkerStateDurabilityTests : IDisposable
     }
 
     [Fact]
+    public async Task PersistedCutCardHold_RestoresAndStartSignalConfirmsNewShoe()
+    {
+        WorkerSettings settings = CreateSettings(bmsTransmitEnabled: false);
+        long previousShoe;
+        await using (AngelBridgeWorker firstWorker = new(settings))
+        {
+            ShoeEndpoint firstEndpoint = firstWorker.Endpoints.Single();
+            previousShoe = firstEndpoint.CurrentShoe;
+            firstEndpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'C'));
+            await WaitUntilAsync(
+                () => CountEvents(settings.Bridge.DatabasePath, "CutCardDrawn") == 1,
+                TimeSpan.FromSeconds(5));
+            Assert.True(firstEndpoint.ShoeEnding);
+            Assert.Equal(BridgeRoundPhases.ShoeChangePending, firstEndpoint.RoundPhase);
+        }
+
+        await using AngelBridgeWorker restoredWorker = new(settings);
+        ShoeEndpoint restored = restoredWorker.Endpoints.Single();
+        Assert.True(restored.ShoeEnding);
+        Assert.Equal(BridgeRoundPhases.ShoeChangePending, restored.RoundPhase);
+
+        restored.Listener.InjectBytes(BuildActiveReport('2', (byte)'S'));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, "NewShoeConfirmed") == 1,
+            TimeSpan.FromSeconds(5));
+        long confirmedShoe = restored.CurrentShoe;
+        restored.Listener.InjectBytes(BuildActiveReport('3', (byte)'S'));
+        await Task.Delay(100);
+
+        Assert.Equal(BridgeGameNumbering.NextShoe(previousShoe), confirmedShoe);
+        Assert.Equal(0, restored.CurrentRound);
+        Assert.False(restored.ShoeEnding);
+        Assert.Equal(BridgeRoundPhases.ConnectedWaitingBoundary, restored.RoundPhase);
+        Assert.True(restored.AwaitingFirstAuthoritativeResultAfterShoeChange);
+        Assert.Equal(1, CountEvents(settings.Bridge.DatabasePath, "NewShoeConfirmed"));
+    }
+
+    [Fact]
+    public async Task StartSignalDuringIncompleteOldRound_AuditsAndQuarantinesLateResult()
+    {
+        WorkerSettings settings = CreateSettings(bmsTransmitEnabled: false);
+        Guid startUid = Guid.NewGuid();
+        ShoeEndpoint source = CreateArmedEndpoint(settings.Shoes[0], startUid);
+        WorkerStateStore store = new(settings.Bridge.StatePath);
+        store.Save(source);
+        BridgeEventJournal journal = new(settings.Bridge.DatabasePath);
+        await journal.AppendAsync(
+            StartGamePayload(source, startUid),
+            queueForDelivery: false);
+
+        await using AngelBridgeWorker worker = new(settings);
+        ShoeEndpoint endpoint = worker.Endpoints.Single();
+        long previousShoe = endpoint.CurrentShoe;
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'C'));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, "CutCardDrawn") == 1,
+            TimeSpan.FromSeconds(5));
+        Assert.Equal(BridgeRoundPhases.Dealing, endpoint.RoundPhase);
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'S'));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, "IncompleteAtShoeChange") == 1 &&
+                  CountEvents(settings.Bridge.DatabasePath, "NewShoeConfirmed") == 1,
+            TimeSpan.FromSeconds(5));
+        long newShoe = endpoint.CurrentShoe;
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('3', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, "LateGameResultAfterShoeChange") == 1,
+            TimeSpan.FromSeconds(5));
+
+        Assert.Equal(BridgeGameNumbering.NextShoe(previousShoe), newShoe);
+        Assert.Equal(newShoe, endpoint.CurrentShoe);
+        Assert.Equal(0, endpoint.CurrentRound);
+        Assert.Equal(0, CountEvents(settings.Bridge.DatabasePath, "GameResult"));
+        Assert.True(endpoint.AwaitingFirstAuthoritativeResultAfterShoeChange);
+    }
+
+    [Fact]
     public async Task CorruptPersistedCardsJson_RejectsTheNextProjectionAndRollsBackTheEvent()
     {
         WorkerSettings settings = CreateSettings(bmsTransmitEnabled: false);

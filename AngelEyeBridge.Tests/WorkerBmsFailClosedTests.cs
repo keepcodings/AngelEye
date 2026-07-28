@@ -132,20 +132,52 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TransportStatusTelegram_DoesNotClearShoeEnding()
+    public async Task CutThenStartSignal_AutomaticallyChangesOnlyTheSameEndpointOnce()
     {
         WorkerSettings settings = CreateSettings(
             readOnly: true,
             healthPort: null,
-            Endpoint("901", "SHOE901", bmsTransmitEnabled: false));
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: false),
+            Endpoint("902", "SHOE902", bmsTransmitEnabled: false));
         await using AngelBridgeWorker worker = new(settings);
         using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint901 = worker.Endpoints.Single(endpoint => endpoint.SourceDataCode == "901");
+        ShoeEndpoint endpoint902 = worker.Endpoints.Single(endpoint => endpoint.SourceDataCode == "902");
+        long initial901Shoe = endpoint901.CurrentShoe;
+        long initial902Shoe = endpoint902.CurrentShoe;
 
-        worker.Endpoints[0].Listener.InjectBytes(BuildActiveReport('1', (byte)'C'));
-        await WaitUntilAsync(() => worker.Endpoints[0].ShoeEnding, cancellation.Token);
-        worker.Endpoints[0].Listener.InjectBytes(BuildActiveReport('2', (byte)'S'));
+        endpoint902.Listener.InjectBytes(BuildActiveReport('1', (byte)'S'));
+        await Task.Delay(100, cancellation.Token);
+        Assert.Equal(initial902Shoe, endpoint902.CurrentShoe);
 
-        Assert.True(worker.Endpoints[0].ShoeEnding);
+        endpoint901.Listener.InjectBytes(BuildActiveReport('2', (byte)'C'));
+        endpoint901.Listener.InjectBytes(BuildActiveReport('3', (byte)'C'));
+        await WaitUntilAsync(() => endpoint901.ShoeEnding, cancellation.Token);
+        endpoint901.Listener.InjectBytes(BuildActiveReport('4', (byte)'S'));
+        await WaitUntilAsync(
+            () => CountEvents(
+                settings.Bridge.DatabasePath,
+                type: "NewShoeConfirmed",
+                status: "LocalOnly") == 1,
+            cancellation.Token);
+        long confirmedShoe = endpoint901.CurrentShoe;
+        endpoint901.Listener.InjectBytes(BuildActiveReport('5', (byte)'S'));
+        await Task.Delay(100, cancellation.Token);
+
+        Assert.Equal(BridgeGameNumbering.NextShoe(initial901Shoe), confirmedShoe);
+        Assert.Equal(0, endpoint901.CurrentRound);
+        Assert.False(endpoint901.ShoeEnding);
+        Assert.Equal(BridgeRoundPhases.ConnectedWaitingBoundary, endpoint901.RoundPhase);
+        Assert.True(endpoint901.AwaitingFirstAuthoritativeResultAfterShoeChange);
+        Assert.Equal(initial902Shoe, endpoint902.CurrentShoe);
+        Assert.Equal(1, endpoint902.CurrentRound);
+        Assert.False(endpoint902.ShoeEnding);
+        Assert.Equal(
+            1,
+            CountEvents(
+                settings.Bridge.DatabasePath,
+                type: "NewShoeConfirmed",
+                status: "LocalOnly"));
     }
 
     [Fact]

@@ -342,6 +342,22 @@ sudo cp -a /var/backups/angel-eye-bridge/20260723-query-console/etc/. /etc/angel
 服務啟動後，目前靴號 / 局號會寫入 `/var/lib/angel-eye-bridge/bridge-state.json`。  
 systemd 重啟時會優先套用狀態檔，不會每次都回到 appsettings 的初始局號。
 
+### 每桌 `C → S` 自動換靴
+
+- 901、902、903 等 endpoint 各自保存鞋尾狀態；一桌的 `C` 或 `S` 不會改到其他桌。
+- 收到 `Cutting Card (C)` 時，Worker 持久保存 `ShoeEnding` 並取消後續開局排程。若當桌已有合法進行中的最後一局，該局牌面與結果仍可完成；完成後停在 `ShoeChangePending`。
+- 實體換靴後，同桌收到 `Start of Communication (S)` 才會自動執行一次新靴：靴號依當日規則增加／重設、round 歸零、清除舊牌面並回到 `ConnectedWaitingBoundary`。沒有同桌 `C` 的 `S` 只記錄診斷。
+- 自動換靴不建立 `StartGame`、不啟動倒數、不向牌盒送 Lock／Unlock 或任何控制指令。新靴第 1 局仍必須等待可信 round boundary。
+- `bridge-state.json` 會保存 `C` 後的等待狀態，因此 Worker 在 `C`、`S` 之間重啟後仍可由同桌 `S` 完成一次；重複 `C/S` 不會重複加靴。
+- 若 `S` 到達時舊局仍未有結果，SQLite 會留下 `IncompleteAtShoeChange`；之後可疑的舊結果會以 `LateGameResultAfterShoeChange` 隔離，不會改動新靴。成功換靴會留下 `NewShoeConfirmed`，這三種事件都是 `LocalOnly`。
+
+排查時可同時看桌碼、舊／新靴與封包 sequence：
+
+```bash
+sudo journalctl -u angel-eye-bridge --since "30 minutes ago" --no-pager \
+  | grep -E "CutCardDrawn|StartOfCommunication|自動換靴|IncompleteAtShoeChange|LateGameResultAfterShoeChange"
+```
+
 Worker SQLite 不使用 EF Migration。新版程式啟動時會在 transaction 內執行相容 schema upgrade；raw frame、round phase、boundary evidence、牌面、結果與 delivery identity 任一損毀時都 fail closed。部署前必須備份 `bridge-events.sqlite` 與 `bridge-state.json`，並先以停用 BMS 傳送的設定做 config check。
 
 BMS 與 Worker 必須協調升級：先部署含 `AngelEventReceipt`／`AngelRecoveryCommand` EF Migration 與專用 client-credentials API 的 BMS，再由安全管道配置每台 Worker 的 client ID/secret，最後才更新 Worker。舊版自簽 JWT、固定 token、`AutoStartRoundOnConnect` 與 `IncrementAfterFinalResult` 語意不可繼續沿用。QA 完成設定檢查與人工 boundary 驗證前，Worker 維持停用。

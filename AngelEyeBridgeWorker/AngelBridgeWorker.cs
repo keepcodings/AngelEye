@@ -191,14 +191,9 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             Log(shoe, type, data);
         };
         endpoint.ProtocolSignalObserved += (shoe, signal) =>
-            RunSerializedEndpointEvent(shoe, () =>
-            {
-                Log(
-                    shoe,
-                    "PROTOCOL",
-                    $"{signal.Kind} seq={signal.Sequence}; diagnostic only, round state unchanged.");
-                return Task.CompletedTask;
-            });
+            RunSerializedEndpointEvent(
+                shoe,
+                () => EndpointProtocolSignalObservedAsync(shoe, signal));
         endpoint.TransportStateChanged += (shoe, state) =>
             RunSerializedEndpointEvent(
                 shoe,
@@ -254,6 +249,77 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             $"Transport {state.Kind}; round continuity cannot be proven.");
         _stateStore.Save(endpoint);
         return Task.CompletedTask;
+    }
+
+    private async Task EndpointProtocolSignalObservedAsync(
+        ShoeEndpoint endpoint,
+        SerialListener.ProtocolSignal signal)
+    {
+        Log(
+            endpoint,
+            "PROTOCOL",
+            $"{signal.Kind} seq={signal.Sequence}; shoeEnding={endpoint.ShoeEnding}, phase={endpoint.RoundPhase}.");
+        if (signal.Kind != SerialListener.ProtocolSignalKind.StartOfCommunication ||
+            !endpoint.ShoeEnding)
+        {
+            Log(
+                endpoint,
+                "PROTOCOL",
+                $"{signal.Kind} seq={signal.Sequence}; diagnostic only, no same-desk cut-card hold.");
+            return;
+        }
+
+        CancelPendingNextRound(endpoint);
+        long previousShoe = endpoint.CurrentShoe;
+        long previousRound = endpoint.CurrentRound;
+        string previousPhase = endpoint.RoundPhase;
+        bool incompleteOldRound =
+            endpoint.StartGameEventUid.HasValue &&
+            previousPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing;
+        if (incompleteOldRound)
+        {
+            await PublishBridgeEventAsync(
+                "IncompleteAtShoeChange",
+                endpoint,
+                new
+                {
+                    previousShoe,
+                    previousRound,
+                    previousPhase,
+                    trigger = "CuttingCardDrawn->StartOfCommunication",
+                    protocolSequence = signal.Sequence,
+                    rawBytes = signal.RawBytes
+                }).ConfigureAwait(false);
+            Log(
+                endpoint,
+                "WARN",
+                $"同桌 C 後於舊局未完成時收到 S；保留 {previousShoe}/{previousRound} 為 IncompleteAtShoeChange，不補造賽果。");
+        }
+
+        if (!endpoint.TryConfirmNewShoeFromStartSignal(signal))
+        {
+            return;
+        }
+
+        _stateStore.Save(endpoint);
+        await PublishBridgeEventAsync(
+            "NewShoeConfirmed",
+            endpoint,
+            new
+            {
+                previousShoe,
+                previousRound,
+                newShoe = endpoint.CurrentShoe,
+                newRound = endpoint.CurrentRound,
+                trigger = "CuttingCardDrawn->StartOfCommunication",
+                protocolSequence = signal.Sequence,
+                rawBytes = signal.RawBytes,
+                incompleteOldRound
+            }).ConfigureAwait(false);
+        Log(
+            endpoint,
+            "SYS",
+            $"牌盒自動換靴完成: {previousShoe}/{previousRound} -> {endpoint.CurrentShoe}/0；S seq={signal.Sequence}；等待可信開局邊界。");
     }
 
     private Task ConnectAllAsync(CancellationToken cancellationToken)
@@ -401,6 +467,26 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     {
         try
         {
+            if (endpoint.AwaitingFirstAuthoritativeResultAfterShoeChange)
+            {
+                Log(
+                    endpoint,
+                    "WARN",
+                    $"新靴尚未具備合法 StartGame 與完整必要牌面，隔離遲到 GameResult {result.Result}/{result.Pair}，不改變新靴狀態。");
+                await PublishBridgeEventAsync(
+                    "LateGameResultAfterShoeChange",
+                    endpoint,
+                    new
+                    {
+                        result = result.Result,
+                        pair = result.Pair,
+                        protocolSequence = result.Seq,
+                        rawBytes = result.RawBytes
+                    }).ConfigureAwait(false);
+                _stateStore.Save(endpoint);
+                return;
+            }
+
             DateTimeOffset sourceTimestamp = DateTimeOffset.UtcNow;
             bool roundWasLegallyArmed =
                 HasCreatedStartGame(endpoint) &&
@@ -503,11 +589,11 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             CancelPendingNextRound(endpoint);
             Log(endpoint, "EVENT", $"CutCardDrawn {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
-            endpoint.MarkShoeChangePending();
             _stateStore.Save(endpoint);
             await PublishBridgeEventAsync("CutCardDrawn", endpoint, new
             {
                 shoeEnding = true,
+                protocolSequence = cutCard.Seq,
                 rawBytes = cutCard.RawBytes
             }).ConfigureAwait(false);
         }
@@ -925,6 +1011,9 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         "CardDrawn" => "Dealing",
         "GameResult" => "Settled",
         "CutCardDrawn" => "ShoeEnding",
+        "IncompleteAtShoeChange" => "ShoeChangeIncomplete",
+        "NewShoeConfirmed" => BridgeRoundPhases.ConnectedWaitingBoundary,
+        "LateGameResultAfterShoeChange" => "Quarantined",
         "Error" => "Error",
         "ErrorCleared" => "Normal",
         "LockStatus" => "Locked",

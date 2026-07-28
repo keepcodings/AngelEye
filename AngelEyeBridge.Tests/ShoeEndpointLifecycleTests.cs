@@ -68,6 +68,7 @@ public sealed class ShoeEndpointLifecycleTests
         Assert.Equal(confirmedShoe, endpoint.CurrentShoe);
         Assert.Equal(0, endpoint.CurrentRound);
         Assert.Equal("operator-action-1", endpoint.CaptureRuntimeState().LastNewShoeActionId);
+        Assert.False(endpoint.AwaitingFirstAuthoritativeResultAfterShoeChange);
     }
 
     [Fact]
@@ -137,6 +138,103 @@ public sealed class ShoeEndpointLifecycleTests
             card => Assert.Equal((1, "Spade", "8"), (card.Index, card.Suit, card.Value)),
             card => Assert.Equal((2, "Heart", "10"), (card.Index, card.Suit, card.Value)));
         Assert.Single(endpoint.BankerCards);
+    }
+
+    [Fact]
+    public void CutCardDuringArmedRound_AllowsFinalRoundToFinishBeforeShoeChange()
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202607280001,
+            currentRound: 12);
+        endpoint.ArmRoundBoundary(
+            BridgeBoundaryStrategies.DerivedAfterPreviousResult,
+            DateTimeOffset.UtcNow.AddSeconds(-5),
+            Guid.NewGuid());
+        endpoint.MarkStartGameStored("Pending");
+        endpoint.MarkDealing();
+        endpoint.GameResultReceived += (shoe, result) =>
+            shoe.MarkFinalResultStored(DateTimeOffset.UtcNow, result.Result);
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'C'));
+
+        Assert.True(endpoint.ShoeEnding);
+        Assert.Equal(BridgeRoundPhases.Dealing, endpoint.RoundPhase);
+
+        endpoint.Listener.InjectBytes(
+            BuildActiveReport('2', (byte)'D', 0x81, 0xB8));
+        endpoint.Listener.InjectBytes(
+            BuildActiveReport('3', (byte)'G', 0x91));
+
+        Assert.Single(endpoint.PlayerCards);
+        Assert.Equal(BridgeRoundPhases.ShoeChangePending, endpoint.RoundPhase);
+        Assert.True(endpoint.ShoeEnding);
+    }
+
+    [Fact]
+    public void StartSignalWithoutSameEndpointCutCard_DoesNotAdvanceShoe()
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202607280001,
+            currentRound: 12);
+
+        bool confirmed = endpoint.TryConfirmNewShoeFromStartSignal(
+            new SerialListener.ProtocolSignal(
+                SerialListener.ProtocolSignalKind.StartOfCommunication,
+                "1",
+                "05 31 53 03"));
+
+        Assert.False(confirmed);
+        Assert.Equal(202607280001, endpoint.CurrentShoe);
+        Assert.Equal(12, endpoint.CurrentRound);
+    }
+
+    [Fact]
+    public void CutThenStartSignal_ConfirmsNewShoeOnceWithoutAllocatingRound()
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202607280001,
+            currentRound: 12);
+        SerialListener.ProtocolSignal signal = new(
+            SerialListener.ProtocolSignalKind.StartOfCommunication,
+            "2",
+            "05 32 53 03");
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'C'));
+
+        bool first = endpoint.TryConfirmNewShoeFromStartSignal(
+            signal,
+            new DateTime(2026, 7, 28));
+        bool duplicate = endpoint.TryConfirmNewShoeFromStartSignal(
+            signal,
+            new DateTime(2026, 7, 28));
+
+        Assert.True(first);
+        Assert.False(duplicate);
+        Assert.Equal(202607280002, endpoint.CurrentShoe);
+        Assert.Equal(0, endpoint.CurrentRound);
+        Assert.Null(endpoint.CurrentRoundId);
+        Assert.False(endpoint.ShoeEnding);
+        Assert.Equal(BridgeRoundPhases.ConnectedWaitingBoundary, endpoint.RoundPhase);
+        Assert.True(endpoint.AwaitingFirstAuthoritativeResultAfterShoeChange);
+    }
+
+    [Fact]
+    public void CrossDayCutThenStartSignal_ResetsToFirstShoeForNewDate()
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202607270005,
+            currentRound: 58);
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'C'));
+
+        bool confirmed = endpoint.TryConfirmNewShoeFromStartSignal(
+            new SerialListener.ProtocolSignal(
+                SerialListener.ProtocolSignalKind.StartOfCommunication,
+                "2",
+                "05 32 53 03"),
+            new DateTime(2026, 7, 28));
+
+        Assert.True(confirmed);
+        Assert.Equal(202607280001, endpoint.CurrentShoe);
+        Assert.Equal(0, endpoint.CurrentRound);
     }
 
     private static ShoeEndpoint CreateEndpoint(long currentShoe, long currentRound) =>

@@ -316,7 +316,7 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 
 目前部署範本一律使用 `autoStartRoundOnConnect=false` 與 `autoStartNextRoundAfterResult=false`。收到上一局 `GameResult` 後不以固定秒數推測下一局；在 Angel Eye II-EX 的實體新局 boundary 尚未完成現場驗證前，Worker 保持等待／人工對齊，不補造下一局 `StartGame`。`R` retransmission 也不代表新局開始。工程 GUI 的模擬跑局與手動測試不得視為正式 Worker 的 boundary 來源。
 
-收到 `CutCardDrawn` 後，Bridge 不會自動下一局，會標記此靴已到鞋尾並停止自動跑局。正式 read-only 模式下，Bridge 只靠流程狀態忽略未按 `新靴` 前收到的後續實體牌面；若工程授權已啟用，才會嘗試對實體牌盒送出 `Lock ON`。現場停靴 / 換靴完成後，操作員按 GUI `新靴`只會更新本機靴號、清除鞋尾狀態；仍須等待可信開局 boundary，不能因按鈕本身立即送出 `StartGame`。
+Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會為該桌持久保存鞋尾狀態並取消後續開局排程；若 `C` 發生在已合法 armed 的最後一局途中，該局剩餘牌面與最終結果仍可完成。實體換靴後，同桌牌盒送出的 `Start of Communication (S)` 會自動且冪等地完成新靴；沒有同桌 `C` 的 `S` 仍只作連線診斷。自動換靴只更新 Worker 本機靴號、round 0、狀態與 audit，不建立 `StartGame`，也不向牌盒送控制指令。工程 GUI 的 `新靴` 按鈕仍只供直接 GUI／Mock 測試，不是 Headless Worker 的正式操作步驟。
 
 ```json
 {
@@ -350,7 +350,7 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 }
 ```
 
-`eventCode` 必須是實際發牌 `D`，且 `accepted=true` 才能寫入本機 authoritative card projection；`R` retransmission、格式錯誤或與已保存位置衝突的牌只保留 raw evidence，不覆寫既有牌面。`target` 為 `Player` 或 `Banker`，`index` 為該方第幾張牌。此事件只更新本機牌面證據，不寫入 BMS 賽果 DB。若此牌盒已收到 `CutCardDrawn` 但尚未執行有 actionId 與 reason 的 `NewShoeConfirmed`，Bridge 會忽略後續實體 `D` 牌面，不送 `StartGame` 或 `GameResult` 到 BMS。
+`eventCode` 必須是實際發牌 `D`，且 `accepted=true` 才能寫入本機 authoritative card projection；`R` retransmission、格式錯誤或與已保存位置衝突的牌只保留 raw evidence，不覆寫既有牌面。`target` 為 `Player` 或 `Banker`，`index` 為該方第幾張牌。此事件只更新本機牌面證據，不寫入 BMS 賽果 DB。若同桌的 `C` 發生在已合法 armed 的最後一局途中，Bridge 仍接受該局剩餘 `D`；若沒有合法進行中的局，則鞋尾狀態下的後續 `D` 只保留診斷，不得建立另一個舊靴局。
 
 ### 4.3 `GameResult`
 
@@ -398,7 +398,7 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 }
 ```
 
-Bridge 收到切牌事件後會取消待開局 timer，並持久保存 `ShoeEnding/ShoeChangePending`。現場停靴與實體換靴完成後，操作員才可執行帶有唯一 `actionId` 與非敏感 `reason` 的 `NewShoeConfirmed`；相同 actionId 重複提交不會再次加靴。確認後只切換到新靴 round 0，仍須等待可信 boundary，不會立即建立第 1 局倒數或 `StartGame`。跨日換靴時靴號依日期從 `yyyyMMdd001` 開始。
+Bridge 收到切牌事件後會取消待開局 timer，並為該 endpoint 持久保存 `ShoeEnding`；沒有進行中合法局時立即進入 `ShoeChangePending`，有最後一局時則待其結果完成後進入。之後只有同一 endpoint 的 `S` 可自動執行一次 `NewShoeConfirmed`，切換到新靴 round 0、清除舊牌面與鞋尾狀態；重複 `C/S` 不會再次加靴，其他桌不受影響。跨日換靴時靴號依日期從 `yyyyMMdd001` 開始。若 `S` 早於舊局結果，Worker 會保存 `IncompleteAtShoeChange` 且不補造結果；換靴後、尚未具備新靴合法 StartGame 與必要牌面前收到的 terminal result 會保存為 `LateGameResultAfterShoeChange` 並隔離。所有換靴 audit 都是 `LocalOnly`，不送 BMS。
 
 ### 4.4 `Error`
 
@@ -463,7 +463,7 @@ Mock 行為：
 
 - `模擬發牌`：依百家樂發牌流程注入下一張 `CardDrawn`；單局最多閒 / 莊各 3 張。若本局不應再抽牌而仍按下，會模擬 `Error / Overdraw`。
 - `模擬結算`：依目前 GUI 牌面計算閒 / 莊點數、輸贏與對子；同一局只會送出一次 `GameResult`，並與實體 `GameResult` 一樣保留結果 3 秒後才進入下一局倒數。
-- `模擬切牌`：模擬現場抽到切牌，Bridge 會送出 `CutCardDrawn`、標記 `ShoeEnding`、停止自動跑局並取消下一局倒數；後續需由操作員按 `新靴` 模擬現場停靴 / 換靴確認，按下後只切到新靴 round 0，不直接建立 `StartGame`。
+- `模擬切牌`：模擬現場抽到切牌，Bridge 會送出 `CutCardDrawn`、標記 `ShoeEnding`、停止自動跑局並取消下一局倒數；工程 GUI／Mock 後續仍由操作員按 `新靴` 模擬換靴確認。正式 Headless Worker 則使用同桌實體 `C → S` 自動換靴。兩種路徑都只切到新靴 round 0，不直接建立 `StartGame`。
 - `自動跑局`：自動發閒 1、莊 1、閒 2、莊 2，再依標準百家樂規則補第三張並結算；結算後同樣保留結果 3 秒，再進入下一局倒數。若開啟 N 局後切牌設定，會在完成第 N 局結算且保留結果 3 秒後注入 `C`，停止自動跑局並走 `CutCardDrawn` / `ShoeEnding` 流程。
 - `重置測試`：停止自動跑局，清空本機 Mock 牌面、結算橫幅與模擬錯誤狀態；不變更靴號。下一次 `模擬發牌` 會從新一局第一張開始。
 

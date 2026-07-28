@@ -174,7 +174,11 @@ public sealed class WorkerStateStore
             return false;
         }
 
-        if (runtime.ShoeEnding && phase != BridgeRoundPhases.ShoeChangePending)
+        if (runtime.ShoeEnding &&
+            phase is not (
+                BridgeRoundPhases.Countdown or
+                BridgeRoundPhases.Dealing or
+                BridgeRoundPhases.ShoeChangePending))
         {
             error = "shoe-ending state conflicts with round phase";
             return false;
@@ -186,6 +190,13 @@ public sealed class WorkerStateStore
             hasNewShoeAction != runtime.LastNewShoeConfirmedAtUtc.HasValue)
         {
             error = "new-shoe audit fields are incomplete";
+            return false;
+        }
+
+        if (runtime.AwaitingFirstAuthoritativeResultAfterShoeChange &&
+            (!hasNewShoeAction || runtime.ShoeEnding))
+        {
+            error = "new-shoe result quarantine is missing a completed shoe-change audit";
             return false;
         }
 
