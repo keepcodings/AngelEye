@@ -255,6 +255,11 @@ public sealed class BridgeWorkerSettings
     /// </summary>
     public bool AutoStartRoundOnConnect { get; set; } = false;
 
+    /// <summary>
+    /// Retained only so older deployment JSON can still be read. Production round
+    /// boundaries come exclusively from a verified Player #1 telegram, so
+    /// normalization always forces this retired timer behavior off.
+    /// </summary>
     public bool AutoStartNextRoundAfterResult { get; set; } = false;
 
     public int ResultToNextRoundDelaySeconds { get; set; } = 3;
@@ -278,6 +283,7 @@ public sealed class BridgeWorkerSettings
         BridgeName = string.IsNullOrWhiteSpace(BridgeName) ? "AngelEyeBridge" : BridgeName.Trim();
         ConnectionMode = ShoeConnectionMode.Normalize(ConnectionMode);
         AutoStartRoundOnConnect = false;
+        AutoStartNextRoundAfterResult = false;
         TotalBetTimeSeconds = Math.Clamp(TotalBetTimeSeconds, 0, 120);
         ResultToNextRoundDelaySeconds = Math.Clamp(ResultToNextRoundDelaySeconds, 0, 60);
         ReconnectSeconds = Math.Clamp(ReconnectSeconds, 3, 300);

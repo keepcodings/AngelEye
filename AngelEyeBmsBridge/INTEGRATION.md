@@ -314,7 +314,9 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 
 只有在 Worker 收到 QA 已驗證的非重送 `D / Player #1` 後，才會先持久化 `totalBetTime=0` 的 `StartGame`，再保存該張牌。單純啟動、連上、重連 MOXA、`Stand By`、時間間隔或同靴批次暫停都不代表新局。BMS 以 `TimeToBet=0` 建立未開放下注的 registered unfinished round；此事件只更新即時桌況，不寫入賽果 DB。
 
-目前部署範本一律使用 `autoStartRoundOnConnect=false` 與 `autoStartNextRoundAfterResult=false`。收到上一局 `GameResult` 後不以固定秒數推測下一局；在 Angel Eye II-EX 的實體新局 boundary 尚未完成現場驗證前，Worker 保持等待／人工對齊，不補造下一局 `StartGame`。`R` retransmission 也不代表新局開始。工程 GUI 的模擬跑局與手動測試不得視為正式 Worker 的 boundary 來源。
+目前部署範本一律使用 `autoStartRoundOnConnect=false` 與 `autoStartNextRoundAfterResult=false`。正式 Worker 也會在設定正規化時強制關閉舊版 `autoStartNextRoundAfterResult=true`，runtime 已移除結果後 timer；收到上一局 `GameResult` 後不以固定秒數推測下一局，只有新的非重送 `D / Player #1` 才能建立下一局 `StartGame`。`R` retransmission 也不代表新局開始。工程 GUI 的模擬跑局與手動測試不得視為正式 Worker 的 boundary 來源。
+
+Worker 從舊日期 `bridge-state.json` 恢復時不會在啟動、重連或燒牌階段直接改靴；它會等到該桌第一個可信的非重送 `Player #1`，比較 Worker 主機本地日期。若舊 shoe 日期不同，先切到當日 `yyyyMMdd0001/1`，再依序保存 `StartGame` 與該張 Player #1；同日重啟則沿用既有 shoe/round。既有由舊 timer 產生、但沒有實體牌局的 BMS 未結算資料不得由 Worker 合成賽果，必須由 BMS 營運流程取消或清理。
 
 Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會為該桌持久保存鞋尾狀態並取消後續開局排程；若 `C` 發生在已合法 armed 的最後一局途中，該局剩餘牌面與最終結果仍可完成。實體換靴後，同桌牌盒送出的 `Start of Communication (S)` 會自動且冪等地完成新靴；沒有同桌 `C` 的 `S` 仍只作連線診斷。自動換靴只更新 Worker 本機靴號、round 0、狀態與 audit，不建立 `StartGame`，也不向牌盒送控制指令。工程 GUI 的 `新靴` 按鈕仍只供直接 GUI／Mock 測試，不是 Headless Worker 的正式操作步驟。
 
@@ -354,7 +356,7 @@ Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會�
 
 ### 4.3 `GameResult`
 
-`GameResult` 語意接近 T9 `Settle`。BMS 端只在通過 StartGame、牌面完整性與事件 identity 檢查後寫入 `GameResultBAC`。正式 Worker 預設 `autoStartNextRoundAfterResult=false`，結果只讓狀態進入 `WaitingForRoundBoundary`，不以固定秒數補造下一局。`DerivedAfterPreviousResult` 僅供經批准的 QA 驗證，且斷線、新靴、錯誤、切牌、先到的牌訊或另一 terminal event 都會取消 timer。正式 read-only 模式不送任何實體牌盒控制命令。
+`GameResult` 語意接近 T9 `Settle`。BMS 端只在通過 StartGame、牌面完整性與事件 identity 檢查後寫入 `GameResultBAC`。正式 Worker 的結果只讓狀態進入 `WaitingForRoundBoundary`，不以固定秒數補造下一局；舊版 `DerivedAfterPreviousResult` timer 已從 Headless Worker runtime 移除，只保留舊狀態值的反序列化相容性。正式 read-only 模式不送任何實體牌盒控制命令。
 
 ```json
 {
@@ -398,7 +400,7 @@ Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會�
 }
 ```
 
-Bridge 收到切牌事件後會取消待開局 timer，並為該 endpoint 持久保存 `ShoeEnding`；沒有進行中合法局時立即進入 `ShoeChangePending`，有最後一局時則待其結果完成後進入。之後只有同一 endpoint 的 `S` 可自動執行一次 `NewShoeConfirmed`，切換到新靴 round 0、清除舊牌面與鞋尾狀態；重複 `C/S` 不會再次加靴，其他桌不受影響。跨日換靴時靴號依日期從 `yyyyMMdd001` 開始。若 `S` 早於舊局結果，Worker 會保存 `IncompleteAtShoeChange` 且不補造結果；換靴後、尚未具備新靴合法 StartGame 與必要牌面前收到的 terminal result 會保存為 `LateGameResultAfterShoeChange` 並隔離。所有換靴 audit 都是 `LocalOnly`，不送 BMS。
+Bridge 收到切牌事件後會為該 endpoint 持久保存 `ShoeEnding`；沒有進行中合法局時立即進入 `ShoeChangePending`，有最後一局時則待其結果完成後進入。之後只有同一 endpoint 的 `S` 可自動執行一次 `NewShoeConfirmed`，切換到新靴 round 0、清除舊牌面與鞋尾狀態；重複 `C/S` 不會再次加靴，其他桌不受影響。跨日換靴時靴號依日期從 `yyyyMMdd001` 開始。若 `S` 早於舊局結果，Worker 會保存 `IncompleteAtShoeChange` 且不補造結果；換靴後、尚未具備新靴合法 StartGame 與必要牌面前收到的 terminal result 會保存為 `LateGameResultAfterShoeChange` 並隔離。所有換靴 audit 都是 `LocalOnly`，不送 BMS。
 
 ### 4.4 `Error`
 

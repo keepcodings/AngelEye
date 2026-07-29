@@ -221,6 +221,140 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task RestoredOldDate_BurnDoesNotAdvance_FirstPlayerOneStartsCurrentDateFirstShoe()
+    {
+        ShoeEndpointSettings endpointSettings =
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
+        endpointSettings.CurrentShoe = 202607270001;
+        endpointSettings.CurrentRound = 1;
+        endpointSettings.CurrentRoundId = 1;
+        endpointSettings.TotalBetTimeSeconds = 0;
+        WorkerSettings settings = CreateSettings(
+            readOnly: true,
+            healthPort: null,
+            endpointSettings);
+        new WorkerStateStore(settings.Bridge.StatePath).Save(new ShoeEndpoint(endpointSettings));
+
+        FixedTimeProvider clock = new(
+            new DateTimeOffset(2026, 7, 29, 6, 6, 0, TimeSpan.Zero),
+            TimeSpan.FromHours(8));
+        await using AngelBridgeWorker worker = new(settings, clock);
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint = worker.Endpoints[0];
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'D', 0xC0, 0xB8));
+        endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'D', 0xD9, 0x4D));
+        await Task.Delay(100, cancellation.Token);
+
+        Assert.Equal(202607270001, endpoint.CurrentShoe);
+        Assert.Equal(1, endpoint.CurrentRound);
+        Assert.Equal(0, CountEvents(settings.Bridge.DatabasePath, type: "StartGame"));
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('3', (byte)'D', 0x81, 0xB8));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "StartGame") == 1,
+            cancellation.Token);
+
+        Assert.Equal(202607290001, endpoint.CurrentShoe);
+        Assert.Equal(1, endpoint.CurrentRound);
+        Assert.Equal(
+            [(202607290001L, 1L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "StartGame"));
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('4', (byte)'D', 0x91, 0x4D));
+        endpoint.Listener.InjectBytes(BuildActiveReport('5', (byte)'D', 0x82, 0xB9));
+        endpoint.Listener.InjectBytes(BuildActiveReport('6', (byte)'D', 0x92, 0x41));
+        endpoint.Listener.InjectBytes(BuildActiveReport('7', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 1,
+            cancellation.Token);
+
+        Assert.Equal(
+            [(202607290001L, 1L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "GameResult"));
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('8', (byte)'D', 0x81, 0xB7));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "StartGame") == 2,
+            cancellation.Token);
+
+        Assert.Equal(202607290001, endpoint.CurrentShoe);
+        Assert.Equal(2, endpoint.CurrentRound);
+        Assert.Equal(
+            [(202607290001L, 1L), (202607290001L, 2L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "StartGame"));
+    }
+
+    [Fact]
+    public async Task RestoredSameDate_DoesNotResetShoeOrRoundUntilNextPlayerOne()
+    {
+        ShoeEndpointSettings endpointSettings =
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
+        endpointSettings.CurrentShoe = 202607290001;
+        endpointSettings.CurrentRound = 5;
+        endpointSettings.CurrentRoundId = 5;
+        WorkerSettings settings = CreateSettings(
+            readOnly: true,
+            healthPort: null,
+            endpointSettings);
+        new WorkerStateStore(settings.Bridge.StatePath).Save(new ShoeEndpoint(endpointSettings));
+
+        FixedTimeProvider clock = new(
+            new DateTimeOffset(2026, 7, 29, 6, 6, 0, TimeSpan.Zero),
+            TimeSpan.FromHours(8));
+        await using AngelBridgeWorker worker = new(settings, clock);
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint = worker.Endpoints[0];
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'D', 0xC0, 0xB8));
+        await Task.Delay(100, cancellation.Token);
+        Assert.Equal(202607290001, endpoint.CurrentShoe);
+        Assert.Equal(5, endpoint.CurrentRound);
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'D', 0x81, 0xB9));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "StartGame") == 1,
+            cancellation.Token);
+
+        Assert.Equal(202607290001, endpoint.CurrentShoe);
+        Assert.Equal(6, endpoint.CurrentRound);
+    }
+
+    [Fact]
+    public async Task LegacyResultTimerSetting_DoesNotCreatePhantomNextRound()
+    {
+        ShoeEndpointSettings endpointSettings =
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
+        endpointSettings.TotalBetTimeSeconds = 0;
+        WorkerSettings settings = CreateSettings(
+            readOnly: true,
+            healthPort: null,
+            endpointSettings);
+        settings.Bridge.AutoStartNextRoundAfterResult = true;
+        settings.Bridge.ResultToNextRoundDelaySeconds = 1;
+        await using AngelBridgeWorker worker = new(settings);
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint = worker.Endpoints[0];
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'D', 0x81, 0xB8));
+        endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'D', 0x91, 0x4D));
+        endpoint.Listener.InjectBytes(BuildActiveReport('3', (byte)'D', 0x82, 0xB9));
+        endpoint.Listener.InjectBytes(BuildActiveReport('4', (byte)'D', 0x92, 0x41));
+        endpoint.Listener.InjectBytes(BuildActiveReport('5', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 1,
+            cancellation.Token);
+        long completedRound = endpoint.CurrentRound;
+        await Task.Delay(TimeSpan.FromMilliseconds(1300), cancellation.Token);
+
+        Assert.Equal(completedRound, endpoint.CurrentRound);
+        Assert.Equal(1, CountEvents(settings.Bridge.DatabasePath, type: "StartGame"));
+        Assert.Equal(
+            [(endpoint.CurrentShoe, completedRound)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "StartGame"));
+    }
+
+    [Fact]
     public async Task MidRoundStartup_SkipsPartialRound_ThenNextPlayerOneRealigns()
     {
         ShoeEndpointSettings endpointSettings =
@@ -709,7 +843,7 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
         DeskName = $"{sourceDataCode}桌",
         SourceDataCode = sourceDataCode,
         ShoeId = shoeId,
-        CurrentShoe = 202607240001,
+        CurrentShoe = BridgeGameNumbering.TodayFirstShoe(),
         CurrentRound = 1,
         CurrentRoundId = 1,
         ConnectionMode = ShoeConnectionMode.MoxaTcp,
@@ -806,6 +940,24 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
         return types.ToArray();
     }
 
+    private static (long Shoe, long Round)[] ReadEventIdentities(string dbPath, string type)
+    {
+        using SqliteConnection connection = new($"Data Source={dbPath}");
+        connection.Open();
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT shoe, round FROM bridge_events WHERE type = $type ORDER BY event_id;";
+        command.Parameters.AddWithValue("$type", type);
+        using SqliteDataReader reader = command.ExecuteReader();
+        List<(long Shoe, long Round)> identities = [];
+        while (reader.Read())
+        {
+            identities.Add((reader.GetInt64(0), reader.GetInt64(1)));
+        }
+
+        return identities.ToArray();
+    }
+
     private static JsonDocument ReadEventPayload(string dbPath, string type)
     {
         using SqliteConnection connection = new($"Data Source={dbPath}");
@@ -864,5 +1016,25 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
 
         byte[] bcc = Encoding.ASCII.GetBytes(SerialListener.CalculateBcc(packetWithoutBcc));
         return packetWithoutBcc.Concat(bcc).ToArray();
+    }
+
+    private sealed class FixedTimeProvider : TimeProvider
+    {
+        private readonly DateTimeOffset _utcNow;
+        private readonly TimeZoneInfo _localTimeZone;
+
+        public FixedTimeProvider(DateTimeOffset utcNow, TimeSpan localOffset)
+        {
+            _utcNow = utcNow;
+            _localTimeZone = TimeZoneInfo.CreateCustomTimeZone(
+                "AngelEye-Test-TimeZone",
+                localOffset,
+                "AngelEye Test Time Zone",
+                "AngelEye Test Time Zone");
+        }
+
+        public override DateTimeOffset GetUtcNow() => _utcNow;
+
+        public override TimeZoneInfo LocalTimeZone => _localTimeZone;
     }
 }

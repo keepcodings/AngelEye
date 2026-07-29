@@ -25,8 +25,8 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     private readonly HashSet<string> _creatingStartGames = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _publishedStartGames = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _handledBmsCommandIds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<ShoeEndpoint, CancellationTokenSource> _pendingNextRoundCountdowns = [];
     private readonly WorkerHttpRouter _httpRouter;
+    private readonly TimeProvider _timeProvider;
     private readonly object _roundGate = new();
     private readonly object _commandGate = new();
     private readonly SemaphoreSlim _rawFrameGate = new(1, 1);
@@ -42,9 +42,10 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
 
     internal BridgeEventJournal Journal => _journal;
 
-    public AngelBridgeWorker(WorkerSettings settings)
+    public AngelBridgeWorker(WorkerSettings settings, TimeProvider? timeProvider = null)
     {
         _settings = settings;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _stateStore = new WorkerStateStore(settings.Bridge.StatePath);
         foreach (ShoeEndpointSettings shoe in settings.Shoes)
         {
@@ -124,17 +125,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         if (cts != null && !cts.IsCancellationRequested)
         {
             cts.Cancel();
-        }
-
-        CancellationTokenSource[] pendingCountdowns;
-        lock (_roundGate)
-        {
-            pendingCountdowns = _pendingNextRoundCountdowns.Values.ToArray();
-            _pendingNextRoundCountdowns.Clear();
-        }
-        foreach (CancellationTokenSource pending in pendingCountdowns)
-        {
-            pending.Cancel();
         }
 
         foreach (Task? task in new[] { _reconnectTask, _statusTask, _healthTask })
@@ -224,7 +214,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                CancelPendingNextRound(endpoint);
                 endpoint.MarkAlignmentRequired(
                     $"Serialized endpoint event failed: {ex.GetType().Name}.");
                 TrySaveFailClosedState(endpoint);
@@ -244,7 +233,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             return Task.CompletedTask;
         }
 
-        CancelPendingNextRound(endpoint);
         endpoint.MarkAlignmentRequired(
             $"Transport {state.Kind}; round continuity cannot be proven.");
         _stateStore.Save(endpoint);
@@ -269,7 +257,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             return;
         }
 
-        CancelPendingNextRound(endpoint);
         long previousShoe = endpoint.CurrentShoe;
         long previousRound = endpoint.CurrentRound;
         string previousPhase = endpoint.RoundPhase;
@@ -422,14 +409,15 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             if (card.EventCode != 'R' && IsBaccaratCardForBms(card))
             {
-                CancelPendingNextRound(endpoint);
                 if (!HasCreatedStartGame(endpoint) &&
                     IsVerifiedPlayerOneBoundary(card))
                 {
-                    DateTimeOffset boundaryAtUtc = DateTimeOffset.UtcNow;
+                    DateTimeOffset boundaryAtUtc = _timeProvider.GetUtcNow();
+                    DateTime boundaryLocalTime = _timeProvider.GetLocalNow().DateTime;
                     if (endpoint.TryArmRoundFromPlayerOne(
                             boundaryAtUtc,
-                            Guid.NewGuid()))
+                            Guid.NewGuid(),
+                            boundaryLocalTime))
                     {
                         _stateStore.Save(endpoint);
                         await PublishStartGameIfNeededAsync(
@@ -582,14 +570,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                 Log(endpoint, "API", $"GameResult {endpoint.CurrentShoe}/{endpoint.CurrentRound} {reason}，僅保留本機。");
             }
 
-            if (_settings.Bridge.AutoStartNextRoundAfterResult &&
-                IsNormalBaccaratResult(result.Result) &&
-                hasMandatoryCards &&
-                !endpoint.ShoeEnding &&
-                endpoint.RoundPhase == BridgeRoundPhases.WaitingForRoundBoundary)
-            {
-                ScheduleNextRoundCountdownAfterResult(endpoint, sourceTimestamp);
-            }
         }
         catch (Exception ex)
         {
@@ -603,7 +583,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     {
         try
         {
-            CancelPendingNextRound(endpoint);
             Log(endpoint, "EVENT", $"CutCardDrawn {endpoint.CurrentShoe}/{endpoint.CurrentRound}");
             _stateStore.Save(endpoint);
             await PublishBridgeEventAsync("CutCardDrawn", endpoint, new
@@ -625,7 +604,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     {
         try
         {
-            CancelPendingNextRound(endpoint);
             Log(endpoint, "EVENT", $"Error [{error.ErrorCode}] {error.ErrorMessage}");
             endpoint.MarkAlignmentRequired($"Shoe protocol error {error.ErrorCode}.");
             _stateStore.Save(endpoint);
@@ -674,108 +652,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             LogException(endpoint, "ERR", "ErrorCleared handling failed", ex);
         }
-    }
-
-    private void ScheduleNextRoundCountdownAfterResult(
-        ShoeEndpoint endpoint,
-        DateTimeOffset resultObservedAtUtc)
-    {
-        CancelPendingNextRound(endpoint);
-        CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(_runCts?.Token ?? CancellationToken.None);
-        lock (_roundGate)
-        {
-            _pendingNextRoundCountdowns[endpoint] = cts;
-        }
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                int delaySeconds = _settings.Bridge.ResultToNextRoundDelaySeconds;
-                Log(endpoint, "SYS", $"結算後 {delaySeconds} 秒自動進入下一局倒數。");
-                await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cts.Token).ConfigureAwait(false);
-                DateTimeOffset boundaryAtUtc = DateTimeOffset.UtcNow;
-                RunSerializedEndpointEvent(endpoint, async () =>
-                {
-                    lock (_roundGate)
-                    {
-                        if (!_pendingNextRoundCountdowns.TryGetValue(
-                                endpoint,
-                                out CancellationTokenSource? current) ||
-                            !ReferenceEquals(current, cts) ||
-                            cts.IsCancellationRequested)
-                        {
-                            return;
-                        }
-
-                        _pendingNextRoundCountdowns.Remove(endpoint);
-                    }
-
-                    bool cardArrivedBeforeBoundary =
-                        endpoint.LastCardAtUtc.HasValue &&
-                        endpoint.LastCardAtUtc.Value > resultObservedAtUtc;
-                    if (!endpoint.IsConnected ||
-                        endpoint.InErrorMode ||
-                        endpoint.ShoeEnding ||
-                        cardArrivedBeforeBoundary ||
-                        endpoint.RoundPhase != BridgeRoundPhases.WaitingForRoundBoundary ||
-                        endpoint.LastFinalResultAtUtc != resultObservedAtUtc)
-                    {
-                        return;
-                    }
-
-                    long previousShoe = endpoint.CurrentShoe;
-                    long previousRound = endpoint.CurrentRound;
-                    endpoint.BeginNextRoundCountdown();
-                    bool started =
-                        endpoint.CurrentShoe != previousShoe ||
-                        endpoint.CurrentRound != previousRound;
-                    if (!started)
-                    {
-                        Log(endpoint, "SYS", "下一局 boundary 未推進靴局，取消 StartGame。");
-                        return;
-                    }
-
-                    endpoint.ArmRoundBoundary(
-                        BridgeBoundaryStrategies.DerivedAfterPreviousResult,
-                        boundaryAtUtc,
-                        Guid.NewGuid());
-                    endpoint.StartBetCountdown(boundaryAtUtc, endpoint.TotalBetTimeSeconds);
-                    _stateStore.Save(endpoint);
-                    await PublishStartGameIfNeededAsync(endpoint, boundaryAtUtc).ConfigureAwait(false);
-                });
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                endpoint.MarkAlignmentRequired($"Derived boundary failed: {ex.GetType().Name}.");
-                TrySaveFailClosedState(endpoint);
-                LogException(endpoint, "ERR", "Next round schedule failed", ex);
-            }
-            finally
-            {
-                lock (_roundGate)
-                {
-                    if (_pendingNextRoundCountdowns.TryGetValue(endpoint, out CancellationTokenSource? current) &&
-                        ReferenceEquals(current, cts))
-                    {
-                        _pendingNextRoundCountdowns.Remove(endpoint);
-                    }
-                }
-                cts.Dispose();
-            }
-        });
-    }
-
-    private void CancelPendingNextRound(ShoeEndpoint endpoint)
-    {
-        CancellationTokenSource? pending;
-        lock (_roundGate)
-        {
-            _pendingNextRoundCountdowns.Remove(endpoint, out pending);
-        }
-        pending?.Cancel();
     }
 
     private async Task<bool> PublishStartGameIfNeededAsync(ShoeEndpoint endpoint, DateTimeOffset? startTimeOverride = null)
@@ -939,7 +815,6 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             endpoint.ExecuteSerializedStateTransition(() =>
             {
-                CancelPendingNextRound(endpoint);
                 endpoint.MarkAlignmentRequired($"Raw frame persistence failed: {ex.GetType().Name}.");
                 TrySaveFailClosedState(endpoint);
                 LogException(endpoint, "ERR", "Raw frame persistence failed", ex);

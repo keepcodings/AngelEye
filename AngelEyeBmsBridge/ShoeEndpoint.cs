@@ -734,7 +734,10 @@ public sealed class ShoeEndpoint
     /// Player #1 telegram. The card has already been decoded into the endpoint,
     /// so this transition preserves that card while advancing only round identity.
     /// </summary>
-    public bool TryArmRoundFromPlayerOne(DateTimeOffset observedAtUtc, Guid eventUid)
+    public bool TryArmRoundFromPlayerOne(
+        DateTimeOffset observedAtUtc,
+        Guid eventUid,
+        DateTime? boundaryLocalTime = null)
     {
         if (eventUid == Guid.Empty)
         {
@@ -749,9 +752,19 @@ public sealed class ShoeEndpoint
             return false;
         }
 
-        if (CurrentShoe <= 0)
+        DateTime localTime = boundaryLocalTime ?? DateTime.Now;
+        if (CurrentShoe <= 0 ||
+            !BridgeGameNumbering.IsShoeForDate(CurrentShoe, localTime))
         {
-            CurrentShoe = BridgeGameNumbering.TodayFirstShoe();
+            long previousShoe = CurrentShoe;
+            long previousRound = CurrentRound;
+            CurrentShoe = BridgeGameNumbering.FirstShoeForDate(localTime);
+            CurrentRound = 0;
+            CurrentRoundId = null;
+            LogReceived?.Invoke(
+                this,
+                "SYS",
+                $"Trusted Player #1 crossed local date: {previousShoe}/{previousRound} -> {CurrentShoe}/1.");
         }
 
         CurrentRound++;

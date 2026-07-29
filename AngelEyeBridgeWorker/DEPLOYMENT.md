@@ -349,6 +349,8 @@ systemd 重啟時會優先套用狀態檔，不會每次都回到 appsettings �
 - 實體換靴後，同桌收到 `Start of Communication (S)` 才會自動執行一次新靴：靴號依當日規則增加／重設、round 歸零、清除舊牌面並回到 `ConnectedWaitingBoundary`。沒有同桌 `C` 的 `S` 只記錄診斷。
 - 自動換靴不建立 `StartGame`、不啟動倒數、不向牌盒送 Lock／Unlock 或任何控制指令。新靴第 1 局等待非重送 `D / Player #1`，再建立 `totalBetTime=0` 的 `StartGame`。
 - 正式 ANGEL Worker 以每桌各自的 `Player #1` 作為新局邊界；`Stand By`、時間間隔以及同靴「發十局、暫停、再發十局」不會切靴或推進局號。中途啟動先收到其他牌位時跳過該局，下一個 `Player #1` 才恢復送單。
+- 舊部署即使保留 `autoStartNextRoundAfterResult=true` 也會被 Worker 強制停用；`GameResult` 後不再啟動 timer 或預建下一局，避免現場停牌時留下沒有實體賽果的虛構未結算局。
+- Worker 從舊日期狀態恢復時，只在第一個可信 `Player #1` 邊界切到主機本地日期的 `yyyyMMdd0001/1`；燒牌、啟動、重連不切靴，同日重啟不重設局號。部署前須確認 Rocky Linux 主機時區與本地日期正確。
 - `bridge-state.json` 會保存 `C` 後的等待狀態，因此 Worker 在 `C`、`S` 之間重啟後仍可由同桌 `S` 完成一次；重複 `C/S` 不會重複加靴。
 - 若 `S` 到達時舊局仍未有結果，SQLite 會留下 `IncompleteAtShoeChange`；之後可疑的舊結果會以 `LateGameResultAfterShoeChange` 隔離，不會改動新靴。成功換靴會留下 `NewShoeConfirmed`，這三種事件都是 `LocalOnly`。
 

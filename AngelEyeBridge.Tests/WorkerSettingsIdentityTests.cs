@@ -15,6 +15,20 @@ public sealed class WorkerSettingsIdentityTests
     }
 
     [Fact]
+    public void BridgeNormalize_DisablesRetainedResultTimerSetting()
+    {
+        BridgeWorkerSettings settings = new()
+        {
+            AutoStartNextRoundAfterResult = true,
+            ResultToNextRoundDelaySeconds = 3
+        };
+
+        settings.Normalize(Path.GetTempPath());
+
+        Assert.False(settings.AutoStartNextRoundAfterResult);
+    }
+
+    [Fact]
     public void Validate_RejectsLegacyJwtSigningMode_WhenBmsTransmissionIsEnabled()
     {
         WorkerSettings settings = ValidSettings();
