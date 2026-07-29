@@ -230,6 +230,28 @@ public sealed class WorkerStateDurabilityTests : IDisposable
     }
 
     [Fact]
+    public void CardDrawnIdentity_IsStablePerRoundSideAndIndex()
+    {
+        Guid startUid = Guid.NewGuid();
+
+        Guid playerOne = AngelBridgeWorker.DeriveCardDrawnEventUid(
+            startUid,
+            "Player",
+            1);
+
+        Assert.NotEqual(Guid.Empty, playerOne);
+        Assert.Equal(
+            playerOne,
+            AngelBridgeWorker.DeriveCardDrawnEventUid(startUid, "player", 1));
+        Assert.NotEqual(
+            playerOne,
+            AngelBridgeWorker.DeriveCardDrawnEventUid(startUid, "Banker", 1));
+        Assert.NotEqual(
+            playerOne,
+            AngelBridgeWorker.DeriveCardDrawnEventUid(startUid, "Player", 2));
+    }
+
+    [Fact]
     public async Task ForceQuit_IsRetainedLocallyAndNeverQueuedAsNormalGameResult()
     {
         WorkerSettings settings = CreateSettings(bmsTransmitEnabled: true);

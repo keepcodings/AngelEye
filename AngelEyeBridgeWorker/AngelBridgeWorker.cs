@@ -447,17 +447,38 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                 return;
             }
 
+            bool authoritativeCard = IsAuthoritativeBaccaratCard(endpoint, card);
+            bool allowBmsDelivery =
+                authoritativeCard &&
+                HasCreatedStartGame(endpoint) &&
+                endpoint.StartGameEventUid.HasValue &&
+                endpoint.StartGameEventUid.Value != Guid.Empty;
+            Guid? cardEventUid = allowBmsDelivery
+                ? DeriveCardDrawnEventUid(
+                    endpoint.StartGameEventUid!.Value,
+                    card.Target,
+                    card.Index)
+                : null;
+
             await PublishBridgeEventAsync("CardDrawn", endpoint, new
             {
                 eventCode = card.EventCode.ToString(),
-                accepted = IsAuthoritativeBaccaratCard(endpoint, card),
+                accepted = authoritativeCard,
                 target = card.Target,
                 index = card.Index,
                 suit = card.Suit,
                 value = card.Value,
                 protocolSequence = card.Seq,
                 rawBytes = card.RawBytes
-            }).ConfigureAwait(false);
+            }, rootFields =>
+            {
+                if (cardEventUid.HasValue)
+                {
+                    // CardDrawn 身份綁定已持久化的 StartGame 與實體牌位，
+                    // 讓牌盒重送相同封包時只保留同一筆事件。
+                    rootFields["eventUid"] = cardEventUid.Value;
+                }
+            }, allowBmsDelivery).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -848,7 +869,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     {
         bool queueForDelivery =
             allowBmsDelivery &&
-            type is "StartGame" or "GameResult" &&
+            type is "StartGame" or "CardDrawn" or "GameResult" &&
             IsAuthorizedBmsSender(endpoint);
 
         Dictionary<string, object?> payload = new()
@@ -971,6 +992,48 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         {
             throw new InvalidOperationException(
                 "Derived GameResult eventUid must not be empty.");
+        }
+
+        return result;
+    }
+
+    internal static Guid DeriveCardDrawnEventUid(
+        Guid startGameEventUid,
+        string target,
+        int index)
+    {
+        if (startGameEventUid == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "StartGame eventUid must not be empty.",
+                nameof(startGameEventUid));
+        }
+
+        if (target is null ||
+            !string.Equals(target, "Player", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(target, "Banker", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(target),
+                "Card target must be Player or Banker.");
+        }
+
+        if (index is < 1 or > 3)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(index),
+                "Card index must be 1..3.");
+        }
+
+        string normalizedTarget = target.ToUpperInvariant();
+        byte[] identity = Encoding.UTF8.GetBytes(
+            $"ANGEL/CardDrawn/{startGameEventUid:D}/{normalizedTarget}/{index}");
+        byte[] digest = SHA256.HashData(identity);
+        Guid result = new(digest.AsSpan(0, 16));
+        if (result == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                "Derived CardDrawn eventUid must not be empty.");
         }
 
         return result;

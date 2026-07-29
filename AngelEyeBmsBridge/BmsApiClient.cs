@@ -256,6 +256,14 @@ public sealed class BmsApiClient : IDisposable
                 continue;
             }
 
+            if (string.Equals(pending.Type, "CardDrawn", StringComparison.Ordinal) &&
+                !await journal
+                    .PrepareCardDrawnForDeliveryAsync(pending.EventId)
+                    .ConfigureAwait(false))
+            {
+                continue;
+            }
+
             DateTime claimAt = DateTime.UtcNow;
             if (!await journal
                     .TryClaimForDeliveryAsync(pending.EventId, claimAt)

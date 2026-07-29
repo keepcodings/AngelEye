@@ -762,6 +762,67 @@ public sealed partial class BridgeEventJournal
         return false;
     }
 
+    /// <summary>
+    /// CardDrawn 只用於目前牌局的即時畫面；必須等同局 StartGame 已明確送達，
+    /// 否則保留本機且不跨局、跨重啟補送，避免牌面落到 BMS 的錯誤時間線。
+    /// </summary>
+    public async Task<bool> PrepareCardDrawnForDeliveryAsync(long eventId)
+    {
+        await using SqliteConnection connection = CreateConnection();
+        await connection.OpenAsync().ConfigureAwait(false);
+
+        string? startStatus;
+        await using (SqliteCommand query = connection.CreateCommand())
+        {
+            query.CommandText = """
+                SELECT start.status
+                FROM bridge_events card
+                LEFT JOIN bridge_events start
+                  ON start.type = 'StartGame'
+                 AND start.desk_id = card.desk_id
+                 AND start.device_id = card.device_id
+                 AND start.shoe = card.shoe
+                 AND start.round = card.round
+                 AND (start.round_id = card.round_id OR (start.round_id IS NULL AND card.round_id IS NULL))
+                WHERE card.event_id = $event_id
+                  AND card.type = 'CardDrawn'
+                ORDER BY start.event_id DESC
+                LIMIT 1;
+                """;
+            query.Parameters.AddWithValue("$event_id", eventId);
+            object? scalar = await query.ExecuteScalarAsync().ConfigureAwait(false);
+            startStatus = scalar is null or DBNull
+                ? null
+                : Convert.ToString(scalar, CultureInfo.InvariantCulture);
+        }
+
+        if (string.Equals(startStatus, "Sent", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (string.Equals(startStatus, "Pending", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        await using SqliteCommand localOnly = connection.CreateCommand();
+        localOnly.CommandText = """
+            UPDATE bridge_events
+            SET status = 'LocalOnly',
+                next_retry_utc = NULL,
+                last_error = $reason
+            WHERE event_id = $event_id
+              AND status = 'Pending';
+            """;
+        localOnly.Parameters.AddWithValue("$event_id", eventId);
+        localOnly.Parameters.AddWithValue(
+            "$reason",
+            "CardDrawn was not delivered because its StartGame was not confirmed as sent.");
+        await localOnly.ExecuteNonQueryAsync().ConfigureAwait(false);
+        return false;
+    }
+
     private async Task<string?> ReadLatestStartGameStatusAsync(
         string sourceDataCode,
         string deviceId,
@@ -2266,7 +2327,7 @@ public sealed partial class BridgeEventJournal
             UPDATE bridge_events
             SET status = 'LocalOnly',
                 next_retry_utc = NULL
-            WHERE type NOT IN ('StartGame', 'GameResult')
+            WHERE type NOT IN ('StartGame', 'CardDrawn', 'GameResult')
               AND status <> 'Sent';
             """);
     }
@@ -2330,7 +2391,7 @@ public sealed partial class BridgeEventJournal
     }
 
     private static bool IsBmsDeliveryEvent(string type) =>
-        type is "StartGame" or "GameResult";
+        type is "StartGame" or "CardDrawn" or "GameResult";
 
     private static Guid ParseEventUidValue(object? value)
     {

@@ -214,7 +214,7 @@ public sealed class BridgeEventJournalMigrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LegacyPendingDiagnosticEvent_IsMovedOutOfDeliveryOutbox()
+    public async Task LegacyPendingCardDrawn_IsQuarantinedAndNotReplayedAfterStartup()
     {
         Directory.CreateDirectory(_directory);
         string dbPath = Path.Combine(_directory, "legacy-diagnostic.sqlite");
@@ -233,7 +233,7 @@ public sealed class BridgeEventJournalMigrationTests : IDisposable
             command.CommandText = "SELECT status, next_retry_utc FROM bridge_events WHERE event_id = 41;";
             using SqliteDataReader reader = command.ExecuteReader();
             Assert.True(reader.Read());
-            Assert.Equal("LocalOnly", reader.GetString(0));
+            Assert.Equal("Unconfirmed", reader.GetString(0));
             Assert.True(reader.IsDBNull(1));
         }
 

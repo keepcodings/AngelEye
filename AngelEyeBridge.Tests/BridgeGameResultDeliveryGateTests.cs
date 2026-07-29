@@ -66,6 +66,43 @@ public sealed class BridgeGameResultDeliveryGateTests : IDisposable
             7));
     }
 
+    [Fact]
+    public async Task CardDrawn_RequiresSentStartGame_AndIsNeverARecoveryCandidate()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        long startEventId = await journal.AppendAsync(Payload("StartGame"));
+        long cardEventId = await journal.AppendAsync(Payload("CardDrawn"));
+
+        Assert.False(await journal.PrepareCardDrawnForDeliveryAsync(cardEventId));
+        Assert.Equal("Pending", ReadStatus(cardEventId));
+
+        Assert.True(await journal.TryClaimForDeliveryAsync(startEventId, DateTime.UtcNow));
+        await journal.MarkSentAsync(startEventId, DateTime.UtcNow, 200);
+
+        Assert.True(await journal.PrepareCardDrawnForDeliveryAsync(cardEventId));
+        Assert.True(await journal.TryClaimForDeliveryAsync(cardEventId, DateTime.UtcNow));
+        await journal.MarkUnconfirmedAsync(cardEventId, 1, DateTime.UtcNow, "timeout");
+
+        Assert.Empty(
+            await journal.GetDueRecoveryCandidatesAsync(
+                20,
+                DateTimeOffset.UtcNow.AddDays(1)));
+    }
+
+    [Fact]
+    public async Task RejectedStartGame_MakesCardDrawnLocalOnly()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        long startEventId = await journal.AppendAsync(Payload("StartGame"));
+        Assert.True(await journal.TryClaimForDeliveryAsync(startEventId, DateTime.UtcNow));
+        await journal.MarkRejectedAsync(startEventId, 1, DateTime.UtcNow, "400 rejected", 400);
+        long cardEventId = await journal.AppendAsync(Payload("CardDrawn"));
+
+        Assert.False(await journal.PrepareCardDrawnForDeliveryAsync(cardEventId));
+        Assert.Equal("LocalOnly", ReadStatus(cardEventId));
+        Assert.Empty(await journal.GetDueOutboxEventsAsync(20, DateTime.UtcNow));
+    }
+
     public void Dispose()
     {
         SqliteConnection.ClearAllPools();

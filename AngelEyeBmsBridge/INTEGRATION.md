@@ -254,10 +254,10 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 
 ### 3.3 成功與失敗
 
-- HTTP `2xx` 且 ACK 未拒收時視為推送成功，Outbox 事件會標記為 `Sent`。
-- 非 `2xx`、timeout 或 ACK rejected 會記錄在 GUI 事件日誌，並將事件標記為 `Failed`。
-- `Failed` 事件不會刪除；背景 dispatcher 會依遞增延遲自動重送。
-- 重送時使用同一個 `eventId` 與同一份 payload，不會產生新事件。
+- HTTP `2xx` 且 ACK 明確接受同一個 `eventId` / `eventUid` 時視為推送成功，Outbox 事件會標記為 `Sent`。
+- 明確拒絕會標記 `Rejected`；timeout、網路錯誤或 ACK 身份不明會標記 `Unconfirmed`。
+- 正常 `StartGame`、`CardDrawn`、`GameResult` 都只嘗試一次，不因網路恢復或 Worker 重啟自動重送。
+- `CardDrawn` 只在同局 `StartGame` 已明確 `Sent` 後送出；牌事件失敗不進 result recovery，最終 `GameResult` 負責提供權威完整牌面。
 - Bridge GUI 事件日誌與 GCS 接收端 log 都會加上固定前綴 `【ANGEL】`，排查時可直接用此關鍵字過濾，例如 `docker logs gamecontrolservice --tail 200 | Select-String "【ANGEL】"`。
 
 ---
@@ -352,11 +352,15 @@ Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會�
 }
 ```
 
-`eventCode` 必須是實際發牌 `D`，且 `accepted=true` 才能寫入本機 authoritative card projection；`R` retransmission、格式錯誤或與已保存位置衝突的牌只保留 raw evidence，不覆寫既有牌面。`target` 為 `Player` 或 `Banker`，`index` 為該方第幾張牌。此事件只更新本機牌面證據，不寫入 BMS 賽果 DB。若同桌的 `C` 發生在已合法 armed 的最後一局途中，Bridge 仍接受該局剩餘 `D`；若沒有合法進行中的局，則鞋尾狀態下的後續 `D` 只保留診斷，不得建立另一個舊靴局。
+`eventCode` 必須是實際發牌 `D`，且 `accepted=true` 才能寫入本機 authoritative card projection；`R` retransmission、格式錯誤或與已保存位置衝突的牌只保留 raw evidence，不覆寫既有牌面。`target` 為 `Player` 或 `Banker`，`index` 為該方第幾張牌。
+
+每張 authoritative card 會先保存本機，再以「同局 StartGame eventUid＋Player/Banker＋index」產生穩定 `eventUid`。第一張 Player #1 的 `StartGame` 一定先入列；dispatcher 只有在該 StartGame 已明確送達後才對 BMS 做一次 CardDrawn 投遞。BMS 只更新目前 `GameInfoTEL` 牌位，讓既有週期桌況包逐張帶到前端；不建立 `GameResultTEL`、不觸發結算，也不寫 BAC。CardDrawn 失敗、逾時或 Worker 重啟都不補送，最終 `GameResult` 仍會提供完整牌面。
+
+若同桌的 `C` 發生在已合法 armed 的最後一局途中，Bridge 仍接受該局剩餘 `D`；若沒有合法進行中的局，則鞋尾狀態下的後續 `D` 只保留診斷，不得建立另一個舊靴局。
 
 ### 4.3 `GameResult`
 
-`GameResult` 語意接近 T9 `Settle`。BMS 端只在通過 StartGame、牌面完整性與事件 identity 檢查後寫入 `GameResultBAC`。正式 Worker 的結果只讓狀態進入 `WaitingForRoundBoundary`，不以固定秒數補造下一局；舊版 `DerivedAfterPreviousResult` timer 已從 Headless Worker runtime 移除，只保留舊狀態值的反序列化相容性。正式 read-only 模式不送任何實體牌盒控制命令。
+`GameResult` 語意接近 T9 `Settle`。BMS 端只在通過 StartGame、牌面完整性與事件 identity 檢查後寫入 `GameResultTEL`；此完整結果也會修正即時 CardDrawn 可能漏掉的牌位。正式 Worker 的結果只讓狀態進入 `WaitingForRoundBoundary`，不以固定秒數補造下一局；舊版 `DerivedAfterPreviousResult` timer 已從 Headless Worker runtime 移除，只保留舊狀態值的反序列化相容性。正式 read-only 模式不送任何實體牌盒控制命令。
 
 ```json
 {

@@ -221,6 +221,50 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task AuthorizedPlayerOne_QueuesStartGameBeforeStableCardDrawn()
+    {
+        ShoeEndpointSettings endpointSettings =
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
+        endpointSettings.TotalBetTimeSeconds = 0;
+        WorkerSettings settings = CreateSettings(
+            readOnly: false,
+            healthPort: null,
+            endpointSettings);
+        await using AngelBridgeWorker worker = new(settings);
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        byte[] playerOne = BuildActiveReport('1', (byte)'D', 0x81, 0xB8);
+
+        worker.Endpoints[0].Listener.InjectBytes(playerOne);
+        worker.Endpoints[0].Listener.InjectBytes(playerOne);
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "StartGame") == 1 &&
+                  CountEvents(settings.Bridge.DatabasePath, type: "CardDrawn") == 1,
+            cancellation.Token);
+
+        Assert.Equal(
+            ["StartGame", "CardDrawn"],
+            ReadEventTypes(settings.Bridge.DatabasePath));
+        Assert.Equal(
+            1,
+            CountEvents(settings.Bridge.DatabasePath, type: "StartGame", status: "Pending"));
+        Assert.Equal(
+            1,
+            CountEvents(settings.Bridge.DatabasePath, type: "CardDrawn", status: "Pending"));
+
+        using JsonDocument startGame = ReadEventPayload(
+            settings.Bridge.DatabasePath,
+            "StartGame");
+        using JsonDocument cardDrawn = ReadEventPayload(
+            settings.Bridge.DatabasePath,
+            "CardDrawn");
+        Guid startUid = startGame.RootElement.GetProperty("eventUid").GetGuid();
+        Guid cardUid = cardDrawn.RootElement.GetProperty("eventUid").GetGuid();
+        Assert.Equal(
+            AngelBridgeWorker.DeriveCardDrawnEventUid(startUid, "Player", 1),
+            cardUid);
+    }
+
+    [Fact]
     public async Task RestoredOldDate_BurnDoesNotAdvance_FirstPlayerOneStartsCurrentDateFirstShoe()
     {
         ShoeEndpointSettings endpointSettings =

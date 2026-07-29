@@ -141,7 +141,6 @@ public sealed class BridgeEventUidTests : IDisposable
     }
 
     [Theory]
-    [InlineData("CardDrawn")]
     [InlineData("CutCardDrawn")]
     [InlineData("Error")]
     [InlineData("ErrorCleared")]
