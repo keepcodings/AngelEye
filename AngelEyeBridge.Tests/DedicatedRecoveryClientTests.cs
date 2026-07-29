@@ -23,6 +23,19 @@ public sealed class DedicatedRecoveryClientTests : IDisposable
     }
 
     [Fact]
+    public void RecoveryCheck_DefaultAndMinimumPollInterval_AreSixtySeconds()
+    {
+        Assert.Equal(60, new AngelBridgeHeartbeatResponse().NextPollSeconds);
+        Assert.Equal(
+            TimeSpan.FromSeconds(60),
+            BmsApiClient.ResolveNextRecoveryDelay(
+                new AngelBridgeHeartbeatResponse { NextPollSeconds = 15 }));
+        Assert.Equal(
+            TimeSpan.FromSeconds(60),
+            BmsApiClient.CalculateRecoveryErrorDelay(1));
+    }
+
+    [Fact]
     public async Task RecoveryCheck_IsBoundedAndNeverIncludesResultPayload()
     {
         BridgeEventJournal journal = new(_dbPath);
@@ -44,7 +57,7 @@ public sealed class DedicatedRecoveryClientTests : IDisposable
                 data = new
                 {
                     accepted = true,
-                    nextPollSeconds = 15,
+                    nextPollSeconds = 60,
                     commands = Array.Empty<object>(),
                     decisions = Array.Empty<object>()
                 }
@@ -1164,7 +1177,7 @@ public sealed class DedicatedRecoveryClientTests : IDisposable
         data = new
         {
             accepted = true,
-            nextPollSeconds = 15,
+            nextPollSeconds = 60,
             commands = commands ?? [],
             decisions = decisions ?? []
         }

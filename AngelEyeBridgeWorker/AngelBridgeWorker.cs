@@ -423,6 +423,22 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             if (card.EventCode != 'R' && IsBaccaratCardForBms(card))
             {
                 CancelPendingNextRound(endpoint);
+                if (!HasCreatedStartGame(endpoint) &&
+                    IsVerifiedPlayerOneBoundary(card))
+                {
+                    DateTimeOffset boundaryAtUtc = DateTimeOffset.UtcNow;
+                    if (endpoint.TryArmRoundFromPlayerOne(
+                            boundaryAtUtc,
+                            Guid.NewGuid()))
+                    {
+                        _stateStore.Save(endpoint);
+                        await PublishStartGameIfNeededAsync(
+                                endpoint,
+                                boundaryAtUtc)
+                            .ConfigureAwait(false);
+                    }
+                }
+
                 if (!HasCreatedStartGame(endpoint))
                 {
                     endpoint.MarkAlignmentRequired(
@@ -857,6 +873,11 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             return _createdStartGames.Contains(BuildRoundKey(endpoint));
         }
     }
+
+    private static bool IsVerifiedPlayerOneBoundary(SerialListener.CardInfo card) =>
+        card.EventCode == 'D' &&
+        string.Equals(card.Target, "Player", StringComparison.Ordinal) &&
+        card.Index == 1;
 
     private void RestoreStartGameTracking(ShoeEndpoint endpoint)
     {

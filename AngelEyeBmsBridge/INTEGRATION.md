@@ -168,7 +168,7 @@ BMS 分辨同一台現場電腦上的多桌時，以事件 payload 的 `sourceDa
 - `連線方式`：位於上方全域設定區，按 `連線方式` 會開啟設定視窗，整台 Bridge 只能選一種模式：`COM Port` 或 `MOXA TCP`。切換前需先斷開實體牌盒連線。
 - `連線設定`：保留桌台名稱、端點ID、BMS靴號、局號、連線資料、啟用、下注秒數與套用。每張桌只各自填自己的 COM Port，或 MOXA IP / TCP Port。欄位預設唯讀，需按 `編輯設定` 才可修改，避免現場誤觸。
 - `BMS 對應`：設定來源桌碼、來源資料 ID 與是否自動傳送 BMS。新建端點預設不傳送，欄位同樣預設唯讀，需按 `編輯設定` 才可修改。
-- `下注秒數` 是每個桌台端點自己的設定；新局開始時送給 BMS 的 `totalBetTime`，語意參考 T9 `StartGame.TotalBetTime`，預設 20 秒，可依現場桌台設定調整。
+- `下注秒數` 是每個桌台端點自己的設定；正式 ANGEL Worker 沒有下注倒數，送給 BMS 的 `totalBetTime` 固定使用 `0`。GUI 模擬流程仍可使用正數倒數。
 - 第一版正式模式預設 read-only，不會對實體牌盒送 `OP` 命令。GUI 的 `PC 對牌盒請求` 區只保留工程授權後的非日常硬體請求，包含 `OP LK` 鎖定 / 解鎖、`OP EC` 清錯，以及人工實機確認用的 `OP GP 00` 流程確認；未啟用工程授權時，這些按鈕不可送出命令。啟用工程授權需輸入密碼 `a84268426`。Mock 模式不受此限制，因為不會寫實體連線。
 - `Mock 模擬測試`：平常只顯示 Mock 開關；開啟 Mock 後才顯示 `模擬發牌`、`模擬結算`、`模擬切牌`、`自動跑局`、`重置測試`，並可設定自動跑局 N 局後模擬切牌。若實體連線已連線，Mock 模式不可開啟；需先斷線再切換 Mock。
 
@@ -204,7 +204,7 @@ Bridge 會在開始傳送前自動產生 Bearer token；若 token 無法產生�
 
 ### 3.2 補償查詢 / 補送輪詢
 
-Bridge 啟動 BMS 傳送後，會定時向 BMS 發送補償查詢。預設下一次查詢為 15 秒；BMS 可用 `nextPollSeconds` 調整輪詢間隔，Bridge 會限制在 10 秒到 5 分鐘之間。若 BMS 暫時無回應，Bridge 會退避為 30 / 60 / 120 / 300 秒，避免持續打爆 BMS。
+Bridge 啟動 BMS 傳送後，會定時向 BMS 發送補償查詢。預設下一次查詢為 60 秒；BMS 可用 `nextPollSeconds` 調整輪詢間隔，Bridge 會限制在 60 秒到 5 分鐘之間。若 BMS 暫時無回應，Bridge 會退避為 60 / 120 / 300 秒，避免持續打爆 BMS。
 
 ```http
 POST /api/source/angel/recoveries/check HTTP/1.1
@@ -223,7 +223,7 @@ BMS response 可回傳 `commands`：
     "data": {
       "accepted": true,
       "serverTime": "2026-05-29T03:30:00Z",
-      "nextPollSeconds": 15,
+      "nextPollSeconds": 60,
       "rateLimited": false,
       "commands": [
         {
@@ -312,7 +312,7 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 
 ### 4.1 `StartGame`
 
-只有在 Worker 已取得並持久化可信的新局 boundary 後，才會建立 `StartGame`，讓 BMS 進入倒數狀態。單純啟動、連上或重連 MOXA 都不代表新局，也不得建立 `StartGame`。此事件只更新即時桌況，不寫入賽果 DB。
+只有在 Worker 收到 QA 已驗證的非重送 `D / Player #1` 後，才會先持久化 `totalBetTime=0` 的 `StartGame`，再保存該張牌。單純啟動、連上、重連 MOXA、`Stand By`、時間間隔或同靴批次暫停都不代表新局。BMS 以 `TimeToBet=0` 建立未開放下注的 registered unfinished round；此事件只更新即時桌況，不寫入賽果 DB。
 
 目前部署範本一律使用 `autoStartRoundOnConnect=false` 與 `autoStartNextRoundAfterResult=false`。收到上一局 `GameResult` 後不以固定秒數推測下一局；在 Angel Eye II-EX 的實體新局 boundary 尚未完成現場驗證前，Worker 保持等待／人工對齊，不補造下一局 `StartGame`。`R` retransmission 也不代表新局開始。工程 GUI 的模擬跑局與手動測試不得視為正式 Worker 的 boundary 來源。
 

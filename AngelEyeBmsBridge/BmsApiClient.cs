@@ -14,8 +14,8 @@ public sealed class BmsApiClient : IDisposable
 {
     private static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan BusyDelay = TimeSpan.FromMilliseconds(150);
-    private static readonly TimeSpan DefaultRecoveryPollDelay = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan MinRecoveryPollDelay = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan DefaultRecoveryPollDelay = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan MinRecoveryPollDelay = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan MaxRecoveryPollDelay = TimeSpan.FromMinutes(5);
     private static readonly Regex RecoveryCommandIdPattern = new(
         "^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$",
@@ -1454,20 +1454,20 @@ public sealed class BmsApiClient : IDisposable
         return $"#{pending.EventId} eventUid={pending.EventUid} {pending.Type} {pending.SourceDataCode} {pending.Shoe}/{pending.Round}";
     }
 
-    private static TimeSpan ResolveNextRecoveryDelay(AngelBridgeHeartbeatResponse? response)
+    internal static TimeSpan ResolveNextRecoveryDelay(AngelBridgeHeartbeatResponse? response)
     {
         int seconds = response?.NextPollSeconds ?? (int)DefaultRecoveryPollDelay.TotalSeconds;
         seconds = Math.Clamp(seconds, (int)MinRecoveryPollDelay.TotalSeconds, (int)MaxRecoveryPollDelay.TotalSeconds);
         return TimeSpan.FromSeconds(seconds);
     }
 
-    private static TimeSpan CalculateRecoveryErrorDelay(int failureCount)
+    internal static TimeSpan CalculateRecoveryErrorDelay(int failureCount)
     {
         int seconds = failureCount switch
         {
-            <= 1 => 30,
-            2 => 60,
-            3 => 120,
+            <= 1 => 60,
+            2 => 120,
+            3 => 300,
             _ => (int)MaxRecoveryPollDelay.TotalSeconds
         };
         return TimeSpan.FromSeconds(seconds);
@@ -1698,7 +1698,7 @@ public sealed record AngelBridgeHeartbeatResponse
     public IReadOnlyList<AngelBridgeRecoveryDecision> Decisions { get; init; } = [];
 
     /// <summary>Recommended seconds before the next recovery poll.</summary>
-    public int NextPollSeconds { get; init; } = 15;
+    public int NextPollSeconds { get; init; } = 60;
 
     /// <summary>Whether BMS intentionally throttled this polling request.</summary>
     public bool RateLimited { get; init; }

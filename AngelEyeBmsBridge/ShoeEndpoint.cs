@@ -189,11 +189,11 @@ public sealed class ShoeEndpoint
         set => Settings.MockMode = value;
     }
 
-    /// <summary>Betting countdown length for this endpoint.</summary>
+    /// <summary>Betting countdown length for this endpoint. Zero means no betting window.</summary>
     public int TotalBetTimeSeconds
     {
-        get => Math.Clamp(Settings.TotalBetTimeSeconds, 5, 120);
-        set => Settings.TotalBetTimeSeconds = Math.Clamp(value, 5, 120);
+        get => Math.Clamp(Settings.TotalBetTimeSeconds, 0, 120);
+        set => Settings.TotalBetTimeSeconds = Math.Clamp(value, 0, 120);
     }
 
     /// <summary>Gets whether the endpoint is connected or in active mock mode.</summary>
@@ -729,6 +729,46 @@ public sealed class ShoeEndpoint
         _roundSettled = false;
     }
 
+    /// <summary>
+    /// Allocates and arms the next round from the QA-validated, non-retransmission
+    /// Player #1 telegram. The card has already been decoded into the endpoint,
+    /// so this transition preserves that card while advancing only round identity.
+    /// </summary>
+    public bool TryArmRoundFromPlayerOne(DateTimeOffset observedAtUtc, Guid eventUid)
+    {
+        if (eventUid == Guid.Empty)
+        {
+            throw new ArgumentException("StartGame eventUid must not be empty.", nameof(eventUid));
+        }
+
+        if (ShoeEnding ||
+            InErrorMode ||
+            StartGameEventUid.HasValue &&
+            RoundPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing)
+        {
+            return false;
+        }
+
+        if (CurrentShoe <= 0)
+        {
+            CurrentShoe = BridgeGameNumbering.TodayFirstShoe();
+        }
+
+        CurrentRound++;
+        CurrentRoundId = CurrentRound;
+        GameResultText = string.Empty;
+        GameResultColor = Color.White;
+        ClearBetCountdown(notify: false);
+        ArmRoundBoundary(
+            BridgeBoundaryStrategies.VerifiedDeviceSignal,
+            observedAtUtc,
+            eventUid);
+        LastEventAt = DateTime.Now;
+        LastEventText = $"Player #1 boundary {CurrentShoe}/{CurrentRound}";
+        RaiseStateChanged();
+        return true;
+    }
+
     /// <summary>Records the durable local delivery state of the current StartGame.</summary>
     public void MarkStartGameStored(string deliveryState)
     {
@@ -907,6 +947,12 @@ public sealed class ShoeEndpoint
     /// <param name="seconds">Countdown length in seconds.</param>
     public void StartBetCountdown(DateTimeOffset startedAtUtc, int seconds)
     {
+        if (seconds <= 0)
+        {
+            ClearBetCountdown(notify: true);
+            return;
+        }
+
         BetCountdownStartedAtUtc = startedAtUtc;
         BetCountdownSeconds = Math.Clamp(seconds, 5, 120);
         RaiseStateChanged();
@@ -1000,7 +1046,11 @@ public sealed class ShoeEndpoint
         {
             BaccaratCard? existingPlayerOne =
                 PlayerCards.FirstOrDefault(existing => existing.Index == 1);
-            if (existingPlayerOne != null &&
+            bool activeArmedRound =
+                StartGameEventUid.HasValue &&
+                RoundPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing;
+            if (activeArmedRound &&
+                existingPlayerOne != null &&
                 string.Equals(existingPlayerOne.Suit, card.Suit, StringComparison.Ordinal) &&
                 string.Equals(existingPlayerOne.Value, card.Value, StringComparison.Ordinal))
             {

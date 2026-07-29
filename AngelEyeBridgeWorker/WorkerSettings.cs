@@ -68,7 +68,12 @@ public sealed class WorkerSettings
             shoe.MoxaHost = shoe.MoxaHost.Trim();
             shoe.ConnectionMode = mode;
             shoe.MockMode = false;
-            shoe.TotalBetTimeSeconds = Math.Clamp(shoe.TotalBetTimeSeconds <= 0 ? Bridge.TotalBetTimeSeconds : shoe.TotalBetTimeSeconds, 5, 120);
+            shoe.TotalBetTimeSeconds = Math.Clamp(
+                shoe.TotalBetTimeSeconds < 0
+                    ? Bridge.TotalBetTimeSeconds
+                    : shoe.TotalBetTimeSeconds,
+                0,
+                120);
             if (shoe.CurrentShoe <= 0)
             {
                 shoe.CurrentShoe = BridgeGameNumbering.TodayFirstShoe();
@@ -254,7 +259,7 @@ public sealed class BridgeWorkerSettings
 
     public int ResultToNextRoundDelaySeconds { get; set; } = 3;
 
-    public int TotalBetTimeSeconds { get; set; } = 20;
+    public int TotalBetTimeSeconds { get; set; } = 0;
 
     public int ReconnectSeconds { get; set; } = 10;
 
@@ -273,7 +278,7 @@ public sealed class BridgeWorkerSettings
         BridgeName = string.IsNullOrWhiteSpace(BridgeName) ? "AngelEyeBridge" : BridgeName.Trim();
         ConnectionMode = ShoeConnectionMode.Normalize(ConnectionMode);
         AutoStartRoundOnConnect = false;
-        TotalBetTimeSeconds = Math.Clamp(TotalBetTimeSeconds, 5, 120);
+        TotalBetTimeSeconds = Math.Clamp(TotalBetTimeSeconds, 0, 120);
         ResultToNextRoundDelaySeconds = Math.Clamp(ResultToNextRoundDelaySeconds, 0, 60);
         ReconnectSeconds = Math.Clamp(ReconnectSeconds, 3, 300);
         StatusLogSeconds = Math.Clamp(StatusLogSeconds, 10, 600);
