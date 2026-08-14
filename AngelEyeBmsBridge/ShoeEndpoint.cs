@@ -737,7 +737,7 @@ public sealed class ShoeEndpoint
     public bool TryArmRoundFromPlayerOne(
         DateTimeOffset observedAtUtc,
         Guid eventUid,
-        DateTime? boundaryLocalTime = null)
+        DateTime? boundaryUtcTime = null)
     {
         if (eventUid == Guid.Empty)
         {
@@ -752,19 +752,19 @@ public sealed class ShoeEndpoint
             return false;
         }
 
-        DateTime localTime = boundaryLocalTime ?? DateTime.Now;
+        DateTime utcTime = boundaryUtcTime ?? observedAtUtc.UtcDateTime;
         if (CurrentShoe <= 0 ||
-            !BridgeGameNumbering.IsShoeForDate(CurrentShoe, localTime))
+            !BridgeGameNumbering.IsShoeForDate(CurrentShoe, utcTime))
         {
             long previousShoe = CurrentShoe;
             long previousRound = CurrentRound;
-            CurrentShoe = BridgeGameNumbering.FirstShoeForDate(localTime);
+            CurrentShoe = BridgeGameNumbering.FirstShoeForDate(utcTime);
             CurrentRound = 0;
             CurrentRoundId = null;
             LogReceived?.Invoke(
                 this,
                 "SYS",
-                $"Trusted Player #1 crossed local date: {previousShoe}/{previousRound} -> {CurrentShoe}/1.");
+                $"Trusted Player #1 crossed UTC date: {previousShoe}/{previousRound} -> {CurrentShoe}/1.");
         }
 
         CurrentRound++;
@@ -927,7 +927,7 @@ public sealed class ShoeEndpoint
 
         // A game number is immutable after its first card.  The date is checked only
         // when a new round is about to begin, never while receiving later cards/results.
-        if (alignShoeDateForNewRound && !BridgeGameNumbering.IsShoeForDate(CurrentShoe, DateTime.Now))
+        if (alignShoeDateForNewRound && !BridgeGameNumbering.IsShoeForDate(CurrentShoe, DateTime.UtcNow))
         {
             StartNewShoe();
             LogReceived?.Invoke(this, "SYS", $"Cross-day new round: switched BMS shoe to {CurrentShoe}.");

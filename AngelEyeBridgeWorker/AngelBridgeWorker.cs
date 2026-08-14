@@ -413,11 +413,9 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                     IsVerifiedPlayerOneBoundary(card))
                 {
                     DateTimeOffset boundaryAtUtc = _timeProvider.GetUtcNow();
-                    DateTime boundaryLocalTime = _timeProvider.GetLocalNow().DateTime;
                     if (endpoint.TryArmRoundFromPlayerOne(
                             boundaryAtUtc,
-                            Guid.NewGuid(),
-                            boundaryLocalTime))
+                            Guid.NewGuid()))
                     {
                         _stateStore.Save(endpoint);
                         await PublishStartGameIfNeededAsync(

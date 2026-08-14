@@ -10,18 +10,18 @@ public static class BridgeGameNumbering
     private const long ShoeSequenceBase = 10000L;
 
     /// <summary>
-    /// Returns the first shoe number for the current local day.
+    /// Returns the first shoe number for the current UTC day.
     /// </summary>
     /// <returns>The shoe number ending in 0001 for today.</returns>
     public static long TodayFirstShoe()
     {
-        return FirstShoeForDate(DateTime.Now);
+        return FirstShoeForDate(DateTime.UtcNow);
     }
 
     /// <summary>
     /// Returns the first shoe number for a specific date.
     /// </summary>
-    /// <param name="date">The local date used for the yyyyMMdd prefix.</param>
+    /// <param name="date">The UTC date used for the yyyyMMdd prefix.</param>
     /// <returns>The shoe number ending in 0001 for the given date.</returns>
     public static long FirstShoeForDate(DateTime date)
     {
@@ -29,10 +29,10 @@ public static class BridgeGameNumbering
     }
 
     /// <summary>
-    /// Determines whether a BMS shoe number belongs to the specified local date.
+    /// Determines whether a BMS shoe number belongs to the specified UTC date.
     /// </summary>
     /// <param name="shoe">BMS shoe number in yyyyMMddNNNN format.</param>
-    /// <param name="date">The local date to compare with the shoe prefix.</param>
+    /// <param name="date">The UTC date to compare with the shoe prefix.</param>
     /// <returns><see langword="true"/> when the shoe uses the specified date prefix.</returns>
     public static bool IsShoeForDate(long shoe, DateTime date)
     {
@@ -41,14 +41,14 @@ public static class BridgeGameNumbering
     }
 
     /// <summary>
-    /// Advances the current shoe number, resetting to 0001 when the local date changes.
+    /// Advances the current shoe number, resetting to 0001 when the UTC date changes.
     /// </summary>
     /// <param name="currentShoe">Current BMS shoe number.</param>
-    /// <param name="now">Optional local time used by tests or simulations.</param>
+    /// <param name="now">Optional UTC time used by tests or simulations.</param>
     /// <returns>The next BMS shoe number.</returns>
     public static long NextShoe(long currentShoe, DateTime? now = null)
     {
-        DateTime date = now ?? DateTime.Now;
+        DateTime date = now ?? DateTime.UtcNow;
         long datePrefix = long.Parse(date.ToString("yyyyMMdd", CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
         long todayBase = datePrefix * ShoeSequenceBase;
 

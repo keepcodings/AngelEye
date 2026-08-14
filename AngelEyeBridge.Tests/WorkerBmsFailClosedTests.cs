@@ -330,6 +330,42 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task RestoredOldDate_PlayerOneBoundaryUsesUtcDateInsteadOfHostLocalDate()
+    {
+        ShoeEndpointSettings endpointSettings =
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
+        endpointSettings.CurrentShoe = 202607270001;
+        endpointSettings.CurrentRound = 1;
+        endpointSettings.CurrentRoundId = 1;
+        endpointSettings.TotalBetTimeSeconds = 0;
+        WorkerSettings settings = CreateSettings(
+            readOnly: true,
+            healthPort: null,
+            endpointSettings);
+        new WorkerStateStore(settings.Bridge.StatePath).Save(new ShoeEndpoint(endpointSettings));
+
+        // UTC 仍為 7/28，但 Worker host 的 Asia/Taipei 本機時間已進入 7/29。
+        // 靴號日期必須跟隨 UTC，而不是 host local date。
+        FixedTimeProvider clock = new(
+            new DateTimeOffset(2026, 7, 28, 16, 6, 0, TimeSpan.Zero),
+            TimeSpan.FromHours(8));
+        await using AngelBridgeWorker worker = new(settings, clock);
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint = worker.Endpoints[0];
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'D', 0x81, 0xB8));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "StartGame") == 1,
+            cancellation.Token);
+
+        Assert.Equal(202607280001, endpoint.CurrentShoe);
+        Assert.Equal(1, endpoint.CurrentRound);
+        Assert.Equal(
+            [(202607280001L, 1L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "StartGame"));
+    }
+
+    [Fact]
     public async Task RestoredSameDate_DoesNotResetShoeOrRoundUntilNextPlayerOne()
     {
         ShoeEndpointSettings endpointSettings =
