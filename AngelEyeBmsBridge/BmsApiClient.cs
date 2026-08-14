@@ -630,8 +630,11 @@ public sealed class BmsApiClient : IDisposable
             return BridgeCommandHandlingResult.Rejected(validationError);
         }
 
+        bool commandHasExactEventIdentity = command.EventId is > 0 &&
+            Guid.TryParse(command.EventUid, out Guid commandEventUid) &&
+            commandEventUid != Guid.Empty;
         BridgePendingEvent commandIdentity = new(
-            command.EventId!.Value,
+            command.EventId ?? 0,
             "GameResult",
             command.SourceDataCode,
             command.DeviceId,
@@ -647,9 +650,36 @@ public sealed class BmsApiClient : IDisposable
             return BridgeCommandHandlingResult.Rejected(disabled);
         }
 
+        BridgeRecoveryLookupResult lookup = commandHasExactEventIdentity
+            ? await journal.LookupRecoveryGameResultAsync(
+                    command.EventId!.Value,
+                    command.EventUid,
+                    command.SourceDataCode,
+                    command.DeviceId,
+                    command.Shoe!.Value,
+                    command.Round!.Value,
+                    command.RoundId)
+                .ConfigureAwait(false)
+            : await journal.LookupRecoveryGameResultByRoundAsync(
+                    command.SourceDataCode,
+                    command.DeviceId,
+                    command.Shoe!.Value,
+                    command.Round!.Value,
+                    command.RoundId)
+                .ConfigureAwait(false);
+
+        BridgePendingEvent? retained = lookup.Event;
+        AngelBridgeCommand effectiveCommand = retained is null
+            ? command
+            : command with
+            {
+                EventId = retained.EventId,
+                EventUid = retained.EventUid
+            };
+
         DateTimeOffset observedAt = DateTimeOffset.UtcNow;
         BridgeRecoveryAudit requestAudit = BuildCommandAudit(
-            command,
+            effectiveCommand,
             "RecoveryRequested",
             "Authorized recovery dispatch received.",
             observedAt);
@@ -665,7 +695,7 @@ public sealed class BmsApiClient : IDisposable
         if (reservation.Disposition == BridgeRecoveryReservationDisposition.Conflict)
         {
             await RecordReservationConflictAuditAsync(
-                    command,
+                    effectiveCommand,
                     reservation,
                     observedAt)
                 .ConfigureAwait(false);
@@ -673,39 +703,28 @@ public sealed class BmsApiClient : IDisposable
                 $"Recovery command conflict: {reservation.Message}");
         }
 
-        BridgeRecoveryLookupResult lookup = await journal
-            .LookupRecoveryGameResultAsync(
-                command.EventId!.Value,
-                command.EventUid,
-                command.SourceDataCode,
-                command.DeviceId,
-                command.Shoe!.Value,
-                command.Round!.Value,
-                command.RoundId)
-            .ConfigureAwait(false);
         if (lookup.Disposition == "Conflict")
         {
             return await SubmitRecoveryConflictAsync(
-                    command,
+                    effectiveCommand,
                     retained: null,
                     lookup.Message,
                     cancellationToken)
                 .ConfigureAwait(false);
         }
 
-        BridgePendingEvent? retained = lookup.Event;
         JsonElement? gameResult = null;
         string submissionOutcome = "NotFound";
         if (retained != null)
         {
-            if (!await journal
+            if (commandHasExactEventIdentity && !await journal
                     .MarkRecoveryRequestedAsync(retained.EventId, retained.EventUid, command.CommandId)
                     .ConfigureAwait(false))
             {
                 const string stateConflict =
                     "Retained event is not in an authorized recoverable reconciliation state.";
                 return await SubmitRecoveryConflictAsync(
-                        command,
+                        effectiveCommand,
                         retained,
                         stateConflict,
                         cancellationToken)
@@ -714,13 +733,13 @@ public sealed class BmsApiClient : IDisposable
 
             if (!TryReadRetainedGameResult(
                     retained,
-                    command,
+                    effectiveCommand,
                     ResolveBridgeId(),
                     out JsonElement retainedResult,
                     out string payloadError))
             {
                 return await SubmitRecoveryConflictAsync(
-                        command,
+                        effectiveCommand,
                         retained,
                         payloadError,
                         cancellationToken)
@@ -732,7 +751,7 @@ public sealed class BmsApiClient : IDisposable
         }
 
         return await SubmitRecoveryOutcomeAsync(
-                command,
+                effectiveCommand,
                 retained,
                 submissionOutcome,
                 gameResult,
@@ -773,8 +792,8 @@ public sealed class BmsApiClient : IDisposable
             Shoe = command.Shoe!.Value,
             Round = command.Round!.Value,
             RoundId = command.RoundId,
-            EventId = command.EventId!.Value,
-            EventUid = command.EventUid,
+            EventId = command.EventId,
+            EventUid = string.IsNullOrWhiteSpace(command.EventUid) ? null : command.EventUid,
             Outcome = outcome,
             GameResult = gameResult,
             Message = string.IsNullOrWhiteSpace(message) ? null : message
@@ -850,6 +869,12 @@ public sealed class BmsApiClient : IDisposable
             }
 
             AngelBridgeRecoveryAcknowledgement? acknowledgement = envelope?.Data;
+            bool eventUidMatches = string.IsNullOrWhiteSpace(submission.EventUid)
+                ? string.IsNullOrWhiteSpace(acknowledgement?.EventUid)
+                : string.Equals(
+                    acknowledgement?.EventUid,
+                    submission.EventUid,
+                    StringComparison.OrdinalIgnoreCase);
             bool exactIdentity =
                 envelope?.ErrCode == 0 &&
                 acknowledgement?.Accepted == true &&
@@ -859,10 +884,7 @@ public sealed class BmsApiClient : IDisposable
                     StringComparison.Ordinal) &&
                 acknowledgement.Generation == submission.Generation &&
                 acknowledgement.DispatchCount == submission.DispatchCount &&
-                string.Equals(
-                    acknowledgement.EventUid,
-                    submission.EventUid,
-                    StringComparison.OrdinalIgnoreCase);
+                eventUidMatches;
             if (!exactIdentity)
             {
                 return RecoveryPostResult.Failed(
@@ -1147,12 +1169,13 @@ public sealed class BmsApiClient : IDisposable
         AngelBridgeCommand command,
         out string error)
     {
+        bool hasEventId = command.EventId is > 0;
+        bool hasEventUid = Guid.TryParse(command.EventUid, out Guid eventUid) &&
+            eventUid != Guid.Empty;
         bool valid =
             string.Equals(command.Type.Trim(), "RecoverRound", StringComparison.Ordinal) &&
             IsValidRecoveryCommandId(command.CommandId) &&
-            command.EventId is > 0 &&
-            Guid.TryParse(command.EventUid, out Guid eventUid) &&
-            eventUid != Guid.Empty &&
+            hasEventId == hasEventUid &&
             !string.IsNullOrWhiteSpace(command.SourceDataCode) &&
             !string.IsNullOrWhiteSpace(command.DeviceId) &&
             command.Shoe is > 0 &&
@@ -1162,7 +1185,7 @@ public sealed class BmsApiClient : IDisposable
             command.DispatchCount > 0;
         error = valid
             ? string.Empty
-            : "RecoverRound requires an exact eventId/eventUid/table/device/shoe/round/roundId and a valid command authorization.";
+            : "RecoverRound requires an exact round identity, optional complete eventId/eventUid pair, and a valid command authorization.";
         return valid;
     }
 
@@ -1803,9 +1826,11 @@ public sealed record AngelBridgeRecoverySubmission
 
     public long? RoundId { get; init; }
 
-    public long EventId { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? EventId { get; init; }
 
-    public string EventUid { get; init; } = string.Empty;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EventUid { get; init; }
 
     public string Outcome { get; init; } = string.Empty;
 

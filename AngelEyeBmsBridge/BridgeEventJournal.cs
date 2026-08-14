@@ -1442,6 +1442,64 @@ public sealed partial class BridgeEventJournal
     }
 
     /// <summary>
+    /// 在操作員尚不知道 event identity 時，只用已授權的桌台／靴／局查找。
+    /// 只有唯一一筆完整 GameResult 才可回傳；多筆一律視為衝突。
+    /// </summary>
+    public async Task<BridgeRecoveryLookupResult> LookupRecoveryGameResultByRoundAsync(
+        string sourceDataCode,
+        string deviceId,
+        long shoe,
+        long round,
+        long? roundId)
+    {
+        await using SqliteConnection connection = CreateConnection();
+        await connection.OpenAsync().ConfigureAwait(false);
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT event_id, event_uid, type, desk_id, device_id, shoe, round, round_id,
+                   payload_json, retry_count
+            FROM bridge_events
+            WHERE type = 'GameResult'
+              AND desk_id = $desk_id COLLATE NOCASE
+              AND device_id = $device_id COLLATE NOCASE
+              AND shoe = $shoe
+              AND round = $round
+              AND round_id = $round_id
+            ORDER BY event_id
+            LIMIT 2;
+            """;
+        command.Parameters.AddWithValue("$desk_id", sourceDataCode);
+        command.Parameters.AddWithValue("$device_id", deviceId);
+        command.Parameters.AddWithValue("$shoe", shoe);
+        command.Parameters.AddWithValue("$round", round);
+        command.Parameters.AddWithValue("$round_id", roundId.HasValue ? roundId.Value : DBNull.Value);
+
+        var matches = new List<BridgePendingEvent>(2);
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+        while (await reader.ReadAsync().ConfigureAwait(false))
+        {
+            matches.Add(new BridgePendingEvent(
+                reader.GetInt64(0),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetInt64(5),
+                reader.GetInt64(6),
+                reader.GetString(8),
+                reader.GetInt32(9),
+                reader.GetString(1)));
+        }
+
+        return matches.Count switch
+        {
+            0 => BridgeRecoveryLookupResult.NotFound(),
+            1 => BridgeRecoveryLookupResult.Found(matches[0]),
+            _ => BridgeRecoveryLookupResult.Conflict(
+                "Multiple retained GameResult events match the authorized round.")
+        };
+    }
+
+    /// <summary>
     /// Atomically reserves one authoritative dispatch of a recovery command.
     /// Repeated polls with the same dispatch count cannot cause another POST;
     /// a higher BMS dispatch count may explicitly reauthorize a previously
@@ -1453,7 +1511,7 @@ public sealed partial class BridgeEventJournal
 
     /// <summary>
     /// Atomically reserves one active recovery command generation for an exact
-    /// event. A process crash after reservation can only be recovered by the
+    /// round，並允許首次唯一查找到賽果時單向綁定 event identity。A process crash after reservation can only be recovered by the
     /// same command and generation with a strictly higher dispatch count.
     /// </summary>
     public async Task<BridgeRecoveryReservationResult> ReserveRecoveryCommandAsync(
@@ -1462,7 +1520,7 @@ public sealed partial class BridgeEventJournal
         if (!IsValidRecoveryReservation(audit))
         {
             return BridgeRecoveryReservationResult.Conflict(
-                "Recovery reservation requires an exact event identity, generation, and dispatch count.");
+                "Recovery reservation requires an exact round identity, optional complete event identity, generation, and dispatch count.");
         }
 
         await using SqliteConnection connection = CreateConnection();
@@ -1484,13 +1542,26 @@ public sealed partial class BridgeEventJournal
                        (
                            event_id = $event_id
                            OR event_uid = $event_uid COLLATE NOCASE
+                           OR
+                           (
+                               desk_id = $desk_id COLLATE NOCASE
+                               AND device_id = $device_id COLLATE NOCASE
+                               AND shoe = $shoe
+                               AND round = $round
+                               AND round_id = $round_id
+                           )
                        )
                    )
                 ORDER BY generation, dispatch_count, command_id;
                 """;
             query.Parameters.AddWithValue("$command_id", audit.CommandId);
-            query.Parameters.AddWithValue("$event_id", audit.EventId!.Value);
-            query.Parameters.AddWithValue("$event_uid", audit.EventUid);
+            query.Parameters.AddWithValue("$event_id", audit.EventId.HasValue ? audit.EventId.Value : DBNull.Value);
+            query.Parameters.AddWithValue("$event_uid", string.IsNullOrWhiteSpace(audit.EventUid) ? DBNull.Value : audit.EventUid);
+            query.Parameters.AddWithValue("$desk_id", audit.SourceDataCode);
+            query.Parameters.AddWithValue("$device_id", audit.DeviceId);
+            query.Parameters.AddWithValue("$shoe", audit.Shoe!.Value);
+            query.Parameters.AddWithValue("$round", audit.Round!.Value);
+            query.Parameters.AddWithValue("$round_id", audit.RoundId!.Value);
             await using SqliteDataReader reader = await query.ExecuteReaderAsync().ConfigureAwait(false);
             while (await reader.ReadAsync().ConfigureAwait(false))
             {
@@ -1661,27 +1732,60 @@ public sealed partial class BridgeEventJournal
     private static bool IsValidRecoveryReservation(BridgeRecoveryAudit audit) =>
         !string.IsNullOrWhiteSpace(audit.CommandId) &&
         string.Equals(audit.CommandType, "RecoverRound", StringComparison.Ordinal) &&
-        audit.EventId is > 0 &&
-        Guid.TryParse(audit.EventUid, out Guid eventUid) &&
-        eventUid != Guid.Empty &&
         !string.IsNullOrWhiteSpace(audit.SourceDataCode) &&
         !string.IsNullOrWhiteSpace(audit.DeviceId) &&
         audit.Shoe is > 0 &&
         audit.Round is > 0 &&
         audit.RoundId is > 0 &&
         audit.Generation > 0 &&
-        audit.DispatchCount > 0;
+        audit.DispatchCount > 0 &&
+        HasCompleteOrAbsentEventIdentity(audit.EventId, audit.EventUid);
+
+    private static bool HasCompleteOrAbsentEventIdentity(long? eventId, string? eventUid)
+    {
+        bool hasEventId = eventId is > 0;
+        bool hasEventUid = Guid.TryParse(eventUid, out Guid parsed) && parsed != Guid.Empty;
+        return hasEventId == hasEventUid;
+    }
 
     private static bool RecoveryIdentityMatches(
         RecoveryCommandLedgerRow row,
         BridgeRecoveryAudit audit) =>
-        row.EventId == audit.EventId &&
-        string.Equals(row.EventUid, audit.EventUid, StringComparison.OrdinalIgnoreCase) &&
         string.Equals(row.SourceDataCode, audit.SourceDataCode, StringComparison.OrdinalIgnoreCase) &&
         string.Equals(row.DeviceId, audit.DeviceId, StringComparison.OrdinalIgnoreCase) &&
         row.Shoe == audit.Shoe &&
         row.Round == audit.Round &&
-        row.RoundId == audit.RoundId;
+        row.RoundId == audit.RoundId &&
+        EventIdentityMatches(row.EventId, row.EventUid, audit.EventId, audit.EventUid);
+
+    private static bool EventIdentityMatches(
+        long? leftEventId,
+        string? leftEventUid,
+        long? rightEventId,
+        string? rightEventUid)
+    {
+        bool leftHasIdentity = leftEventId is > 0 &&
+            Guid.TryParse(leftEventUid, out Guid leftUid) &&
+            leftUid != Guid.Empty;
+        bool rightHasIdentity = rightEventId is > 0 &&
+            Guid.TryParse(rightEventUid, out Guid rightUid) &&
+            rightUid != Guid.Empty;
+        bool leftIdentityAbsent = leftEventId is null && string.IsNullOrWhiteSpace(leftEventUid);
+        if (!leftIdentityAbsent && !leftHasIdentity)
+        {
+            return false;
+        }
+
+        if (!leftHasIdentity)
+        {
+            // Durable ledger 可由「只知道局」單向綁定成唯一事件；已綁定後不得退回無 identity。
+            return true;
+        }
+
+        return rightHasIdentity &&
+               leftEventId == rightEventId &&
+               string.Equals(leftEventUid, rightEventUid, StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>
     /// Verifies that a terminal decision names the newest locally observed
@@ -2268,9 +2372,8 @@ public sealed partial class BridgeEventJournal
             AND result IN ('RecoveryRequested', 'RecoveryUnconfirmed')
             AND
             (
-                event_id IS NULL
-                OR event_uid IS NULL
-                OR trim(event_uid) = ''
+                (event_id IS NULL AND event_uid IS NOT NULL AND trim(event_uid) <> '')
+                OR (event_id IS NOT NULL AND (event_uid IS NULL OR trim(event_uid) = ''))
                 OR generation <= 0
                 OR dispatch_count <= 0
                 OR event_id IN

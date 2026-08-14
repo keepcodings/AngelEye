@@ -133,6 +133,132 @@ public sealed class DedicatedRecoveryClientTests : IDisposable
     }
 
     [Fact]
+    public async Task AuthorizedRoundLookup_FindsUniqueRetainedResultAndReturnsItsIdentity()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        BridgeRecoveryCandidate candidate = await AddUnconfirmedGameResultAsync(
+            journal,
+            round: 31,
+            roundId: 10031);
+        AngelBridgeCommand lookupCommand = Command(candidate, dispatchCount: 1) with
+        {
+            EventId = null,
+            EventUid = string.Empty
+        };
+        AngelBridgeCommand resolvedCommand = lookupCommand with
+        {
+            EventId = candidate.EventId,
+            EventUid = candidate.EventUid
+        };
+        string recoveryJson = string.Empty;
+        using BmsApiClient client = new(new DelegateHandler(async request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/recoveries/check", StringComparison.Ordinal))
+            {
+                return CheckResponse(commands: [lookupCommand]);
+            }
+
+            recoveryJson = await request.Content!.ReadAsStringAsync();
+            return RecoveryAck(resolvedCommand, "Recovered");
+        }));
+
+        await client.RunRecoveryCheckOnceAsync(Settings(), journal, _ => true, () => []);
+
+        using JsonDocument submitted = JsonDocument.Parse(recoveryJson);
+        Assert.Multiple(() =>
+        {
+            Assert.Equal("Found", submitted.RootElement.GetProperty("outcome").GetString());
+            Assert.Equal(candidate.EventId, submitted.RootElement.GetProperty("eventId").GetInt64());
+            Assert.Equal(candidate.EventUid, submitted.RootElement.GetProperty("eventUid").GetString());
+            Assert.True(submitted.RootElement.TryGetProperty("gameResult", out _));
+            Assert.Equal("Recovered", ReadAuditResult(lookupCommand.CommandId));
+        });
+    }
+
+    [Fact]
+    public async Task AuthorizedRoundLookup_WithNoRetainedResult_PostsNotFoundWithoutInventedIdentity()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        AngelBridgeCommand lookupCommand = new()
+        {
+            CommandId = "recover:901:202607250001:32",
+            Type = "RecoverRound",
+            SourceDataCode = "901",
+            DeviceId = "SHOE901",
+            Shoe = 202607250001,
+            Round = 32,
+            RoundId = 10032,
+            Generation = 1,
+            DispatchCount = 1
+        };
+        string recoveryJson = string.Empty;
+        using BmsApiClient client = new(new DelegateHandler(async request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/recoveries/check", StringComparison.Ordinal))
+            {
+                return CheckResponse(commands: [lookupCommand]);
+            }
+
+            recoveryJson = await request.Content!.ReadAsStringAsync();
+            return RecoveryAck(lookupCommand, "NotFound");
+        }));
+
+        await client.RunRecoveryCheckOnceAsync(Settings(), journal, _ => true, () => []);
+
+        using JsonDocument submitted = JsonDocument.Parse(recoveryJson);
+        Assert.Multiple(() =>
+        {
+            Assert.Equal("NotFound", submitted.RootElement.GetProperty("outcome").GetString());
+            Assert.False(submitted.RootElement.TryGetProperty("eventId", out _));
+            Assert.False(submitted.RootElement.TryGetProperty("eventUid", out _));
+            Assert.False(submitted.RootElement.TryGetProperty("gameResult", out _));
+            Assert.Equal("NotFound", ReadAuditResult(lookupCommand.CommandId));
+        });
+    }
+
+    [Fact]
+    public async Task AuthorizedRoundLookup_WithMultipleRetainedResults_PostsConflictWithoutPayload()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        BridgeRecoveryCandidate first = await AddUnconfirmedGameResultAsync(
+            journal,
+            round: 33,
+            roundId: 10033);
+        await AddUnconfirmedGameResultAsync(journal, round: 33, roundId: 10033);
+        AngelBridgeCommand lookupCommand = Command(first, dispatchCount: 1) with
+        {
+            EventId = null,
+            EventUid = string.Empty
+        };
+        string recoveryJson = string.Empty;
+        using BmsApiClient client = new(new DelegateHandler(async request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/recoveries/check", StringComparison.Ordinal))
+            {
+                return CheckResponse(commands: [lookupCommand]);
+            }
+
+            recoveryJson = await request.Content!.ReadAsStringAsync();
+            return RecoveryAck(lookupCommand, "Conflict");
+        }));
+
+        await client.RunRecoveryCheckOnceAsync(Settings(), journal, _ => true, () => []);
+
+        using JsonDocument submitted = JsonDocument.Parse(recoveryJson);
+        Assert.Multiple(() =>
+        {
+            Assert.Equal("Conflict", submitted.RootElement.GetProperty("outcome").GetString());
+            Assert.False(submitted.RootElement.TryGetProperty("eventId", out _));
+            Assert.False(submitted.RootElement.TryGetProperty("eventUid", out _));
+            Assert.False(submitted.RootElement.TryGetProperty("gameResult", out _));
+            Assert.Contains(
+                "Multiple retained",
+                submitted.RootElement.GetProperty("message").GetString(),
+                StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
     public async Task RetainedResultFromAnotherBridge_IsRejectedWithoutResultDisclosure()
     {
         BridgeEventJournal journal = new(_dbPath);
