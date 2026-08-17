@@ -10,13 +10,7 @@ if (args.Any(static arg => string.Equals(arg, "--check-config", StringComparison
     return 0;
 }
 
-using CancellationTokenSource shutdown = new();
-Console.CancelKeyPress += (_, eventArgs) =>
-{
-    eventArgs.Cancel = true;
-    shutdown.Cancel();
-};
-AppDomain.CurrentDomain.ProcessExit += (_, _) => shutdown.Cancel();
+using WorkerShutdownSignal shutdown = new();
 
 try
 {

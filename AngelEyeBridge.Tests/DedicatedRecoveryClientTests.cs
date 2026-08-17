@@ -36,6 +36,61 @@ public sealed class DedicatedRecoveryClientTests : IDisposable
     }
 
     [Fact]
+    public async Task AwaitingOperator_WithNullCommandMetadata_DoesNotBreakRecoveryPolling()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        BridgeRecoveryCandidate candidate = await AddUnconfirmedGameResultAsync(
+            journal,
+            round: 10,
+            roundId: 9010);
+        using BmsApiClient client = new(new DelegateHandler(_ => Task.FromResult(
+            CheckResponseWithDecision(
+                candidate,
+                decision: "AwaitingOperator",
+                commandId: null,
+                generation: null,
+                dispatchCount: null))));
+
+        await client.RunRecoveryCheckOnceAsync(Settings(), journal, _ => true, () => []);
+
+        Assert.Equal("AwaitingOperator", ReadEventState(candidate.EventId).RecoveryState);
+        Assert.Empty(await journal.GetDueRecoveryCandidatesAsync(
+            20,
+            DateTimeOffset.UtcNow.AddDays(1)));
+    }
+
+    [Fact]
+    public async Task RecoverRound_WithNullCommandMetadata_RemainsFailClosed()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        BridgeRecoveryCandidate candidate = await AddUnconfirmedGameResultAsync(
+            journal,
+            round: 11,
+            roundId: 9011);
+        int recoveryPosts = 0;
+        using BmsApiClient client = new(new DelegateHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/recoveries/check", StringComparison.Ordinal))
+            {
+                return Task.FromResult(CheckResponseWithDecision(
+                    candidate,
+                    decision: "RecoverRound",
+                    commandId: $"recover:901:{candidate.Shoe}:{candidate.Round}",
+                    generation: null,
+                    dispatchCount: null));
+            }
+
+            recoveryPosts++;
+            return Task.FromResult(JsonResponse(new { errCode = 0 }));
+        }));
+
+        await client.RunRecoveryCheckOnceAsync(Settings(), journal, _ => true, () => []);
+
+        Assert.Equal(0, recoveryPosts);
+        Assert.Equal("Conflict", ReadEventState(candidate.EventId).RecoveryState);
+    }
+
+    [Fact]
     public async Task RecoveryCheck_IsBoundedAndNeverIncludesResultPayload()
     {
         BridgeEventJournal journal = new(_dbPath);
@@ -1306,6 +1361,40 @@ public sealed class DedicatedRecoveryClientTests : IDisposable
             nextPollSeconds = 60,
             commands = commands ?? [],
             decisions = decisions ?? []
+        }
+    });
+
+    private static HttpResponseMessage CheckResponseWithDecision(
+        BridgeRecoveryCandidate candidate,
+        string decision,
+        string? commandId,
+        int? generation,
+        int? dispatchCount) => JsonResponse(new
+    {
+        errCode = 0,
+        data = new
+        {
+            accepted = true,
+            nextPollSeconds = 60,
+            commands = Array.Empty<object>(),
+            decisions = new[]
+            {
+                new
+                {
+                    eventId = candidate.EventId,
+                    eventUid = candidate.EventUid,
+                    decision,
+                    commandId,
+                    sourceDataCode = candidate.SourceDataCode,
+                    deviceId = candidate.DeviceId,
+                    shoe = candidate.Shoe,
+                    round = candidate.Round,
+                    roundId = candidate.RoundId,
+                    generation,
+                    dispatchCount,
+                    message = decision
+                }
+            }
         }
     });
 

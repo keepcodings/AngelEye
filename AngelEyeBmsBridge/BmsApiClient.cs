@@ -536,8 +536,8 @@ public sealed class BmsApiClient : IDisposable
                      .IsExactLatestRecoveryCommandAsync(
                          exactCandidate,
                          decision.CommandId,
-                         decision.Generation,
-                         decision.DispatchCount)
+                         decision.Generation!.Value,
+                         decision.DispatchCount!.Value)
                      .ConfigureAwait(false)))
             {
                 await journal
@@ -929,8 +929,8 @@ public sealed class BmsApiClient : IDisposable
         string decision,
         string commandId,
         string message,
-        int generation,
-        int dispatchCount)
+        int? generation,
+        int? dispatchCount)
     {
         if (_journal == null)
         {
@@ -959,8 +959,8 @@ public sealed class BmsApiClient : IDisposable
             Outcome: decision,
             DecisionCount: candidate.DecisionCount + 1,
             TerminalReason: IsTerminalDecision(decision) ? message : string.Empty,
-            Generation: generation,
-            DispatchCount: dispatchCount)).ConfigureAwait(false);
+            Generation: generation.GetValueOrDefault(),
+            DispatchCount: dispatchCount.GetValueOrDefault())).ConfigureAwait(false);
     }
 
     private async Task RecordCommandAuditAsync(
@@ -1153,8 +1153,8 @@ public sealed class BmsApiClient : IDisposable
         if (string.Equals(decision.Decision.Trim(), "RecoverRound", StringComparison.Ordinal) &&
             (!string.Equals(candidate.EventType, "GameResult", StringComparison.Ordinal) ||
              !IsValidRecoveryCommandId(decision.CommandId) ||
-             decision.Generation <= 0 ||
-             decision.DispatchCount <= 0))
+             decision.Generation is not > 0 ||
+             decision.DispatchCount is not > 0))
         {
             error =
                 "RecoverRound requires an exact GameResult identity and a valid commandId, generation, and dispatchCount.";
@@ -1211,8 +1211,8 @@ public sealed class BmsApiClient : IDisposable
         Shoe = decision.Shoe,
         Round = decision.Round,
         RoundId = decision.RoundId,
-        Generation = decision.Generation,
-        DispatchCount = decision.DispatchCount
+        Generation = decision.Generation.GetValueOrDefault(),
+        DispatchCount = decision.DispatchCount.GetValueOrDefault()
     };
 
     private static BridgePendingEvent ToPendingIdentity(BridgeRecoveryCandidate candidate) => new(
@@ -1262,8 +1262,8 @@ public sealed class BmsApiClient : IDisposable
 
     private static bool HasAnyCommandMetadata(AngelBridgeRecoveryDecision decision) =>
         !string.IsNullOrWhiteSpace(decision.CommandId) ||
-        decision.Generation != 0 ||
-        decision.DispatchCount != 0;
+        decision.Generation.GetValueOrDefault() != 0 ||
+        decision.DispatchCount.GetValueOrDefault() != 0;
 
     private static bool HasCompleteCommandMetadata(AngelBridgeRecoveryDecision decision) =>
         IsValidRecoveryCommandId(decision.CommandId) &&
@@ -1798,9 +1798,9 @@ public sealed record AngelBridgeRecoveryDecision
 
     public long? RoundId { get; init; }
 
-    public int Generation { get; init; }
+    public int? Generation { get; init; }
 
-    public int DispatchCount { get; init; }
+    public int? DispatchCount { get; init; }
 
     public string Message { get; init; } = string.Empty;
 }
