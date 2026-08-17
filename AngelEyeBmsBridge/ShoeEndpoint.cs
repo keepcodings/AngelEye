@@ -593,6 +593,41 @@ public sealed class ShoeEndpoint
     }
 
     /// <summary>
+    /// Completes an automatic physical shoe change when the card shoe starts its
+    /// new-shoe burn initialization with the protocol-specific FirstCard #0 frame.
+    /// The transition resets to round zero and never creates StartGame.
+    /// </summary>
+    public bool TryConfirmNewShoeFromFirstCard(
+        SerialListener.CardInfo card,
+        DateTime? now = null)
+    {
+        if (card.EventCode != 'D' ||
+            !string.Equals(card.Target, "FirstCard", StringComparison.Ordinal) ||
+            card.Index != 0 ||
+            AwaitingFirstAuthoritativeResultAfterShoeChange)
+        {
+            return false;
+        }
+
+        string sequence = string.IsNullOrWhiteSpace(card.Seq)
+            ? "unknown"
+            : card.Seq.Trim();
+        string actionId =
+            $"device-first-card:{SourceDataCode}:{DeviceId}:{CurrentShoe}:{sequence}";
+        bool confirmed = ConfirmNewShoe(
+            actionId,
+            $"Card shoe FirstCard #0 sequence {sequence} started physical new-shoe burn initialization.",
+            now);
+        if (confirmed)
+        {
+            AwaitingFirstAuthoritativeResultAfterShoeChange = true;
+            RaiseStateChanged();
+        }
+
+        return confirmed;
+    }
+
+    /// <summary>
     /// Injects a simulated ANGEL active report, including triple transmission behavior.
     /// </summary>
     /// <param name="name">Human-readable simulator event name.</param>
@@ -842,6 +877,15 @@ public sealed class ShoeEndpoint
     /// </summary>
     public void MarkShoeChangePending()
     {
+        if (AwaitingFirstAuthoritativeResultAfterShoeChange)
+        {
+            LogReceived?.Invoke(
+                this,
+                "SYS",
+                "新靴已確認且仍在等待第一個權威結果；忽略同一初始化期間的切牌訊號。");
+            return;
+        }
+
         ShoeEnding = true;
         ClearBetCountdown(notify: false);
         bool canFinishArmedRound =

@@ -237,6 +237,72 @@ public sealed class ShoeEndpointLifecycleTests
         Assert.Equal(0, endpoint.CurrentRound);
     }
 
+    [Fact]
+    public void FirstCardZero_ConfirmsNewShoeOnceWithoutAllocatingRound()
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202608170001,
+            currentRound: 372);
+        SerialListener.CardInfo firstCard = new()
+        {
+            EventCode = 'D',
+            Seq = "3",
+            Target = "FirstCard",
+            Index = 0,
+            Suit = "Club",
+            Value = "K",
+            RawBytes = "05 33 44 C0 AD 03 31 39"
+        };
+
+        bool first = endpoint.TryConfirmNewShoeFromFirstCard(
+            firstCard,
+            new DateTime(2026, 8, 17));
+        bool duplicate = endpoint.TryConfirmNewShoeFromFirstCard(
+            firstCard,
+            new DateTime(2026, 8, 17));
+
+        Assert.True(first);
+        Assert.False(duplicate);
+        Assert.Equal(202608170002, endpoint.CurrentShoe);
+        Assert.Equal(0, endpoint.CurrentRound);
+        Assert.Null(endpoint.CurrentRoundId);
+        Assert.Equal(BridgeRoundPhases.ConnectedWaitingBoundary, endpoint.RoundPhase);
+        Assert.True(endpoint.AwaitingFirstAuthoritativeResultAfterShoeChange);
+    }
+
+    [Fact]
+    public void FirstCardZero_DuringArmedRound_AdvancesWithoutFabricatingResult()
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202608170001,
+            currentRound: 12);
+        endpoint.ArmRoundBoundary(
+            BridgeBoundaryStrategies.VerifiedDeviceSignal,
+            DateTimeOffset.UtcNow,
+            Guid.NewGuid());
+        endpoint.MarkStartGameStored("Pending");
+        endpoint.MarkDealing();
+
+        bool confirmed = endpoint.TryConfirmNewShoeFromFirstCard(
+            new SerialListener.CardInfo
+            {
+                EventCode = 'D',
+                Seq = "3",
+                Target = "FirstCard",
+                Index = 0,
+                Suit = "Club",
+                Value = "K",
+                RawBytes = "05 33 44 C0 AD 03 31 39"
+            },
+            new DateTime(2026, 8, 17));
+
+        Assert.True(confirmed);
+        Assert.Equal(202608170002, endpoint.CurrentShoe);
+        Assert.Equal(0, endpoint.CurrentRound);
+        Assert.Equal(BridgeRoundPhases.ConnectedWaitingBoundary, endpoint.RoundPhase);
+        Assert.True(endpoint.AwaitingFirstAuthoritativeResultAfterShoeChange);
+    }
+
     private static ShoeEndpoint CreateEndpoint(long currentShoe, long currentRound) =>
         new(new ShoeEndpointSettings
         {

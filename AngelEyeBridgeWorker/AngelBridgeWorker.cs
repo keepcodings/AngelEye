@@ -407,6 +407,61 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     {
         try
         {
+            if (IsNewShoeFirstCard(card))
+            {
+                long previousShoe = endpoint.CurrentShoe;
+                long previousRound = endpoint.CurrentRound;
+                string previousPhase = endpoint.RoundPhase;
+                bool incompleteOldRound =
+                    endpoint.StartGameEventUid.HasValue &&
+                    previousPhase is BridgeRoundPhases.Countdown or BridgeRoundPhases.Dealing;
+                if (incompleteOldRound)
+                {
+                    await PublishBridgeEventAsync(
+                        "IncompleteAtShoeChange",
+                        endpoint,
+                        new
+                        {
+                            previousShoe,
+                            previousRound,
+                            previousPhase,
+                            trigger = "FirstCard#0",
+                            protocolSequence = card.Seq,
+                            rawBytes = card.RawBytes
+                        }).ConfigureAwait(false);
+                    Log(
+                        endpoint,
+                        "WARN",
+                        $"舊局未完成時收到 FirstCard #0；保留 {previousShoe}/{previousRound} 為 IncompleteAtShoeChange，不補造賽果。");
+                }
+
+                DateTimeOffset observedAtUtc = _timeProvider.GetUtcNow();
+                if (endpoint.TryConfirmNewShoeFromFirstCard(
+                        card,
+                        observedAtUtc.UtcDateTime))
+                {
+                    _stateStore.Save(endpoint);
+                    await PublishBridgeEventAsync(
+                        "NewShoeConfirmed",
+                        endpoint,
+                        new
+                        {
+                            previousShoe,
+                            previousRound,
+                            newShoe = endpoint.CurrentShoe,
+                            newRound = endpoint.CurrentRound,
+                            trigger = "FirstCard#0",
+                            protocolSequence = card.Seq,
+                            rawBytes = card.RawBytes,
+                            incompleteOldRound
+                        }).ConfigureAwait(false);
+                    Log(
+                        endpoint,
+                        "SYS",
+                        $"牌盒 FirstCard #0 自動換靴完成: {previousShoe}/{previousRound} -> {endpoint.CurrentShoe}/0；seq={card.Seq}；等待 Player #1 開始第 1 局。");
+                }
+            }
+
             if (card.EventCode != 'R' && IsBaccaratCardForBms(card))
             {
                 if (!HasCreatedStartGame(endpoint) &&
@@ -606,7 +661,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             _stateStore.Save(endpoint);
             await PublishBridgeEventAsync("CutCardDrawn", endpoint, new
             {
-                shoeEnding = true,
+                shoeEnding = endpoint.ShoeEnding,
                 protocolSequence = cutCard.Seq,
                 rawBytes = cutCard.RawBytes
             }).ConfigureAwait(false);
@@ -773,6 +828,11 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
         card.EventCode == 'D' &&
         string.Equals(card.Target, "Player", StringComparison.Ordinal) &&
         card.Index == 1;
+
+    private static bool IsNewShoeFirstCard(SerialListener.CardInfo card) =>
+        card.EventCode == 'D' &&
+        string.Equals(card.Target, "FirstCard", StringComparison.Ordinal) &&
+        card.Index == 0;
 
     private void RestoreStartGameTracking(ShoeEndpoint endpoint)
     {

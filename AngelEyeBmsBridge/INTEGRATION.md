@@ -404,7 +404,7 @@ Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會�
 }
 ```
 
-Bridge 收到切牌事件後會為該 endpoint 持久保存 `ShoeEnding`；沒有進行中合法局時立即進入 `ShoeChangePending`，有最後一局時則待其結果完成後進入。之後只有同一 endpoint 的 `S` 可自動執行一次 `NewShoeConfirmed`，切換到新靴 round 0、清除舊牌面與鞋尾狀態；重複 `C/S` 不會再次加靴，其他桌不受影響。跨日換靴時靴號依日期從 `yyyyMMdd001` 開始。若 `S` 早於舊局結果，Worker 會保存 `IncompleteAtShoeChange` 且不補造結果；換靴後、尚未具備新靴合法 StartGame 與必要牌面前收到的 terminal result 會保存為 `LateGameResultAfterShoeChange` 並隔離。所有換靴 audit 都是 `LocalOnly`，不送 BMS。
+Bridge 保留兩條每桌獨立的自動換靴路徑。支援 `C/S` 的牌盒會先持久保存 `ShoeEnding`，再由同桌 `S` 完成一次 `NewShoeConfirmed`；QA 實機未送 `C/S` 時，非重送的 `D / FirstCard #0` 會直接確認牌盒已進入新靴燒牌初始化。兩條路徑都只切換到依 UTC 日期規則產生的新靴 round 0、清除舊牌面並等待 `Player #1`，不會建立 `StartGame` 或送 BMS。重複 FirstCard、`C/S` 或中途重啟不會再次加靴，其他桌不受影響。若確認新靴時舊局尚未完成，Worker 保存 `IncompleteAtShoeChange` 且不補造結果；之後遲到的舊結果會保存為 `LateGameResultAfterShoeChange` 並隔離。所有換靴 audit 都是 `LocalOnly`。
 
 ### 4.4 `Error`
 
