@@ -353,7 +353,8 @@ systemd 重啟時會優先套用狀態檔，不會每次都回到 appsettings �
 - 舊部署即使保留 `autoStartNextRoundAfterResult=true` 也會被 Worker 強制停用；`GameResult` 後不再啟動 timer 或預建下一局，避免現場停牌時留下沒有實體賽果的虛構未結算局。
 - Worker 從舊日期狀態恢復時，優先在可信 `FirstCard #0` 切到 UTC 當日 `yyyyMMdd0001/0`，後續 `Player #1` 建立第 1 局；若現場缺少 FirstCard，Player #1 仍會作為跨日安全網。Burn、BurnCount、啟動、重連與 Stand By 不切靴，同日重啟不重設局號。
 - `bridge-state.json` 會保存 `C` 後的等待狀態，因此 Worker 在 `C`、`S` 之間重啟後仍可由同桌 `S` 完成一次；重複 `C/S` 不會重複加靴。
-- 若 `S` 到達時舊局仍未有結果，SQLite 會留下 `IncompleteAtShoeChange`；之後可疑的舊結果會以 `LateGameResultAfterShoeChange` 隔離，不會改動新靴。成功換靴會留下 `NewShoeConfirmed`，這三種事件都是 `LocalOnly`。
+- 若 `S` 到達時舊局仍未有結果，SQLite 會留下 `IncompleteAtShoeChange`；之後可疑的舊結果會以 `LateGameResultAfterShoeChange` 隔離，兩者仍是 `LocalOnly`。成功換靴的 `NewShoeConfirmed` 現在依該桌傳送權限單次送往 BMS，以新靴 round 0/null roundId 清空 TEL 路圖與舊牌面，不等待第一局。
+- 部署順序：先更新 BMS GameControl 與使用 Core 的平台初始查詢服務，再部署 Worker；舊 BMS 不認得新事件。無 DB migration、不更改 MOXA/BMS 設定。舊 LocalOnly 不升格補送；失敗或 ACK 不明仍不自動重播，等下一個真實新靴牌局更新。單獨 `S` 或 `StandBy` 不觸發清圖。
 
 排查時可同時看桌碼、舊／新靴與封包 sequence：
 

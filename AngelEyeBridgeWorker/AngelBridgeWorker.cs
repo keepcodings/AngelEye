@@ -300,9 +300,8 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                 newRound = endpoint.CurrentRound,
                 trigger = "CuttingCardDrawn->StartOfCommunication",
                 protocolSequence = signal.Sequence,
-                rawBytes = signal.RawBytes,
                 incompleteOldRound
-            }).ConfigureAwait(false);
+            }, allowBmsDelivery: true).ConfigureAwait(false);
         Log(
             endpoint,
             "SYS",
@@ -452,9 +451,8 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
                             newRound = endpoint.CurrentRound,
                             trigger = "FirstCard#0",
                             protocolSequence = card.Seq,
-                            rawBytes = card.RawBytes,
                             incompleteOldRound
-                        }).ConfigureAwait(false);
+                        }, allowBmsDelivery: true).ConfigureAwait(false);
                     Log(
                         endpoint,
                         "SYS",
@@ -927,7 +925,7 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
     {
         bool queueForDelivery =
             allowBmsDelivery &&
-            type is "StartGame" or "CardDrawn" or "GameResult" &&
+            type is "StartGame" or "CardDrawn" or "GameResult" or "NewShoeConfirmed" &&
             IsAuthorizedBmsSender(endpoint);
 
         Dictionary<string, object?> payload = new()
@@ -950,6 +948,12 @@ public sealed class AngelBridgeWorker : IAsyncDisposable
             ["connectionMode"] = endpoint.ConnectionMode
         };
         configureRoot?.Invoke(payload);
+
+        // 換靴是桌況通知，不是牌局；不帶上一局 RoundId，也不把 raw bytes 傳到 BMS。
+        if (type == "NewShoeConfirmed")
+        {
+            payload["roundId"] = null;
+        }
 
         if (Guid.TryParse(endpoint.SourceDataId, out Guid sourceDataId) && sourceDataId != Guid.Empty)
         {

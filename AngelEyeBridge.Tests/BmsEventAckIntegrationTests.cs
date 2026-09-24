@@ -59,6 +59,54 @@ public sealed class BmsEventAckIntegrationTests : IDisposable
         Assert.Equal(pending.EventUid, correlationId);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task NewShoeNotification_DispatchesWithoutStartGame_OnlyOnce(bool success)
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        var payload = StartGamePayload();
+        payload["type"] = "NewShoeConfirmed";
+        payload["round"] = 0;
+        payload["roundId"] = null;
+        long eventId = await journal.AppendAsync(payload);
+        var pending = Assert.Single(await journal.GetDueOutboxEventsAsync(10, DateTime.UtcNow));
+        int requests = 0;
+        using BmsApiClient client = new(new DelegateHandler(_ =>
+        {
+            requests++;
+            return Task.FromResult(success ? JsonResponse(new
+            {
+                errCode = 0, data = new { accepted = true, duplicate = false, eventId, eventUid = pending.EventUid }
+            }) : new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+        }));
+        var settings = new BmsApiSettings("https://bms.test/api/source/angel/events", "test-token");
+        Assert.Equal(1, await client.RunDispatchOnceAsync(settings, journal, _ => true));
+        Assert.Equal(success ? "Sent" : "Unconfirmed", ReadStatus(eventId));
+        // Restart keeps delivery evidence but never replays this notice.
+        journal = new BridgeEventJournal(_dbPath);
+        Assert.Equal(success ? "Sent" : "Unconfirmed", ReadStatus(eventId));
+        Assert.Equal(0, await client.RunDispatchOnceAsync(settings, journal, _ => true));
+        Assert.Equal(1, requests);
+    }
+
+    [Fact]
+    public async Task NewShoeRestart_QuarantinesPending_AndDoesNotPromoteOldLocalOnly()
+    {
+        BridgeEventJournal journal = new(_dbPath);
+        var payload = StartGamePayload();
+        payload["type"] = "NewShoeConfirmed";
+        payload["round"] = 0;
+        payload["roundId"] = null;
+        long pendingId = await journal.AppendAsync(payload);
+        payload.Remove("eventUid");
+        long localId = await journal.AppendAsync(payload, queueForDelivery: false);
+        journal = new BridgeEventJournal(_dbPath);
+        Assert.Equal("Unconfirmed", ReadStatus(pendingId));
+        Assert.Equal("LocalOnly", ReadStatus(localId));
+        Assert.Empty(await journal.GetDueOutboxEventsAsync(10, DateTime.UtcNow));
+    }
+
     [Fact]
     public async Task CachedToken401_InvalidatesAndRetriesExactlyOnceBeforeAccepting()
     {

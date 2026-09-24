@@ -10,6 +10,49 @@ namespace AngelEyeBridge.Tests;
 
 public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
 {
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    public async Task ConfirmedShoe_QueuesOnlyAuthorizedDeskBeforeAnyRound(bool cutThenStart, bool transmit)
+    {
+        WorkerSettings settings = CreateSettings(true, null,
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: transmit),
+            Endpoint("902", "SHOE902", bmsTransmitEnabled: true));
+        await using AngelBridgeWorker worker = new(settings);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint = worker.Endpoints[0];
+        long otherShoe = worker.Endpoints[1].CurrentShoe;
+        byte[] confirmation = cutThenStart
+            ? BuildActiveReport('2', (byte)'S')
+            : BuildActiveReport('2', (byte)'D', 0xC0, 0xAD);
+        if (cutThenStart)
+            endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'C'));
+        endpoint.Listener.InjectBytes(confirmation);
+        await WaitUntilAsync(() => CountEvents(settings.Bridge.DatabasePath,
+            type: "NewShoeConfirmed") == 1, cancellation.Token);
+        endpoint.Listener.InjectBytes(confirmation);
+        await Task.Delay(100, cancellation.Token);
+
+        Assert.Equal(1, CountEvents(settings.Bridge.DatabasePath, type: "NewShoeConfirmed",
+            status: transmit ? "Pending" : "LocalOnly"));
+        Assert.Equal(0, CountEvents(settings.Bridge.DatabasePath, type: "StartGame"));
+        Assert.Equal(otherShoe, worker.Endpoints[1].CurrentShoe);
+        var due = await worker.Journal.GetDueOutboxEventsAsync(20, DateTime.UtcNow);
+        if (!transmit)
+        {
+            Assert.Empty(due);
+            return;
+        }
+        var notice = Assert.Single(due);
+        using JsonDocument payload = JsonDocument.Parse(notice.PayloadJson);
+        Assert.Equal("NewShoeConfirmed", payload.RootElement.GetProperty("type").GetString());
+        Assert.Equal(0, payload.RootElement.GetProperty("round").GetInt32());
+        Assert.Equal(JsonValueKind.Null, payload.RootElement.GetProperty("roundId").ValueKind);
+        Assert.DoesNotContain("rawBytes", notice.PayloadJson);
+    }
+
     private readonly string _directory =
         Path.Combine(Path.GetTempPath(), "angel-eye-tests", Guid.NewGuid().ToString("N"));
 

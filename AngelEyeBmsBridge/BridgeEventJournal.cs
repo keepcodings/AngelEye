@@ -2430,7 +2430,7 @@ public sealed partial class BridgeEventJournal
             UPDATE bridge_events
             SET status = 'LocalOnly',
                 next_retry_utc = NULL
-            WHERE type NOT IN ('StartGame', 'CardDrawn', 'GameResult')
+            WHERE type NOT IN ('StartGame', 'CardDrawn', 'GameResult', 'NewShoeConfirmed')
               AND status <> 'Sent';
             """);
     }
@@ -2494,7 +2494,7 @@ public sealed partial class BridgeEventJournal
     }
 
     private static bool IsBmsDeliveryEvent(string type) =>
-        type is "StartGame" or "CardDrawn" or "GameResult";
+        type is "StartGame" or "CardDrawn" or "GameResult" or "NewShoeConfirmed";
 
     private static Guid ParseEventUidValue(object? value)
     {
