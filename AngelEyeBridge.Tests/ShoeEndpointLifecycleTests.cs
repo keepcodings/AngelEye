@@ -20,6 +20,57 @@ public sealed class ShoeEndpointLifecycleTests
         Assert.Equal(1, endpoint.CurrentRoundId);
     }
 
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(2, 3)]
+    public void PlayerOneOnLaterDate_PreservesShoeAndAdvancesOnlyRound(long previousRound, long nextRound)
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202607270005,
+            currentRound: previousRound);
+        DateTimeOffset boundary = new(2026, 7, 29, 0, 1, 0, TimeSpan.Zero);
+        Guid eventUid = Guid.NewGuid();
+
+        bool armed = endpoint.TryArmRoundFromPlayerOne(boundary, eventUid);
+
+        Assert.True(armed);
+        Assert.Equal(202607270005, endpoint.CurrentShoe);
+        Assert.Equal(nextRound, endpoint.CurrentRound);
+        Assert.Equal(nextRound, endpoint.CurrentRoundId);
+        Assert.Equal(boundary, endpoint.BoundaryObservedAtUtc);
+        Assert.Equal(eventUid, endpoint.StartGameEventUid);
+    }
+
+    [Fact]
+    public void ConfirmedShoeBeforeMidnight_FirstPlayerCardNextDayStartsSameShoeRoundOne()
+    {
+        ShoeEndpoint endpoint = CreateEndpoint(
+            currentShoe: 202608170001,
+            currentRound: 58);
+        bool confirmed = endpoint.TryConfirmNewShoeFromFirstCard(
+            new SerialListener.CardInfo
+            {
+                EventCode = 'D',
+                Seq = "1",
+                Target = "FirstCard",
+                Index = 0,
+                Suit = "Club",
+                Value = "K",
+                RawBytes = "05 31 44 C0 AD 03 31 39"
+            },
+            new DateTime(2026, 8, 17, 23, 59, 0));
+
+        bool armed = endpoint.TryArmRoundFromPlayerOne(
+            new DateTimeOffset(2026, 8, 18, 0, 1, 0, TimeSpan.Zero),
+            Guid.NewGuid());
+
+        Assert.True(confirmed);
+        Assert.True(armed);
+        Assert.Equal(202608170002, endpoint.CurrentShoe);
+        Assert.Equal(1, endpoint.CurrentRound);
+        Assert.Equal(1, endpoint.CurrentRoundId);
+    }
+
     [Fact]
     public void ClearPreview_PreservesShoeEndingSafetyState()
     {

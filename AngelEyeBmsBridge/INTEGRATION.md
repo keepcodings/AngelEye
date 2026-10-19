@@ -316,9 +316,9 @@ GCS 會以 Redis TTL 對同一個 `bridgeId` 做短時間節流；若查詢太�
 
 目前部署範本一律使用 `autoStartRoundOnConnect=false` 與 `autoStartNextRoundAfterResult=false`。正式 Worker 也會在設定正規化時強制關閉舊版 `autoStartNextRoundAfterResult=true`，runtime 已移除結果後 timer；收到上一局 `GameResult` 後不以固定秒數推測下一局，只有新的非重送 `D / Player #1` 才能建立下一局 `StartGame`。`R` retransmission 也不代表新局開始。工程 GUI 的模擬跑局與手動測試不得視為正式 Worker 的 boundary 來源。
 
-Worker 從舊日期 `bridge-state.json` 恢復時不會在啟動、重連或燒牌階段直接改靴；它會等到該桌第一個可信的非重送 `Player #1`，比較 Worker 主機本地日期。若舊 shoe 日期不同，先切到當日 `yyyyMMdd0001/1`，再依序保存 `StartGame` 與該張 Player #1；同日重啟則沿用既有 shoe/round。既有由舊 timer 產生、但沒有實體牌局的 BMS 未結算資料不得由 Worker 合成賽果，必須由 BMS 營運流程取消或清理。
+Worker 在同一實體靴跨日時沿用原靴號，每個可信的非重送 `Player #1` 只接續局號，再依序保存 `StartGame` 與該張牌。從舊日期的有效 `bridge-state.json` 恢復後也保留既有 shoe/round，不會比較日期並強制換靴。例如 10/18 停在 `202610180001/3`，10/19 繼續發會接成 `202610180001/4`；靴號日期代表這靴建立的日期，每局時間另行記錄。只有實際換靴訊號會切換靴號並將 round 歸零。既有由舊 timer 產生、但沒有實體牌局的 BMS 未結算資料不得由 Worker 合成賽果，必須由 BMS 營運流程取消或清理。
 
-Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會為該桌持久保存鞋尾狀態並取消後續開局排程；若 `C` 發生在已合法 armed 的最後一局途中，該局剩餘牌面與最終結果仍可完成。實體換靴後，同桌牌盒送出的 `Start of Communication (S)` 會自動且冪等地完成新靴；沒有同桌 `C` 的 `S` 仍只作連線診斷。自動換靴只更新 Worker 本機靴號、round 0、狀態與 audit，不建立 `StartGame`，也不向牌盒送控制指令。工程 GUI 的 `新靴` 按鈕仍只供直接 GUI／Mock 測試，不是 Headless Worker 的正式操作步驟。
+Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會為該桌持久保存鞋尾狀態並取消後續開局排程；若 `C` 發生在已合法 armed 的最後一局途中，該局剩餘牌面與最終結果仍可完成。實體換靴後，同桌牌盒送出的 `Start of Communication (S)` 會自動且冪等地完成新靴；沒有同桌 `C` 的 `S` 仍只作連線診斷。自動換靴更新 Worker 靴號、round 0、狀態與 audit，並依桌台傳送權限送出 `NewShoeConfirmed` 通知 BMS，不建立 `StartGame`，也不向牌盒送控制指令。工程 GUI 的 `新靴` 按鈕仍只供直接 GUI／Mock 測試，不是 Headless Worker 的正式操作步驟。
 
 ```json
 {
@@ -404,7 +404,7 @@ Headless Worker 收到 `CutCardDrawn (C)` 後不會自動建立下一局，會�
 }
 ```
 
-Bridge 保留兩條每桌獨立的自動換靴路徑。支援 `C/S` 的牌盒會先持久保存 `ShoeEnding`，再由同桌 `S` 完成一次 `NewShoeConfirmed`；QA 實機未送 `C/S` 時，非重送的 `D / FirstCard #0` 會直接確認牌盒已進入新靴燒牌初始化。兩條路徑都只切換到依 UTC 日期規則產生的新靴 round 0、清除舊牌面並等待 `Player #1`，不會建立 `StartGame` 或送 BMS。重複 FirstCard、`C/S` 或中途重啟不會再次加靴，其他桌不受影響。若確認新靴時舊局尚未完成，Worker 保存 `IncompleteAtShoeChange` 且不補造結果；之後遲到的舊結果會保存為 `LateGameResultAfterShoeChange` 並隔離。所有換靴 audit 都是 `LocalOnly`。
+Bridge 保留兩條每桌獨立的自動換靴路徑。支援 `C/S` 的牌盒會先持久保存 `ShoeEnding`，再由同桌 `S` 完成一次 `NewShoeConfirmed`；QA 實機未送 `C/S` 時，非重送的 `D / FirstCard #0` 會直接確認牌盒已進入新靴燒牌初始化。兩條路徑都切換到依確認當下 UTC 日期規則產生的新靴 round 0、清除舊牌面並等待 `Player #1`，不會建立 `StartGame`，但會依桌台傳送權限單次送出 `NewShoeConfirmed`，讓 BMS 清空 TEL 路圖與舊牌面。單純跨日不觸發這兩條路徑，也不送換靴通知。重複 FirstCard、`C/S` 或中途重啟不會再次加靴，其他桌不受影響。若確認新靴時舊局尚未完成，Worker 保存 `IncompleteAtShoeChange` 且不補造結果；之後遲到的舊結果會保存為 `LateGameResultAfterShoeChange` 並隔離。這兩種異常 audit 仍是 `LocalOnly`。
 
 ### 4.4 `Error`
 

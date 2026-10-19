@@ -351,7 +351,8 @@ systemd 重啟時會優先套用狀態檔，不會每次都回到 appsettings �
 - 自動換靴不建立 `StartGame`、不啟動倒數、不向牌盒送 Lock／Unlock 或任何控制指令。新靴第 1 局等待非重送 `D / Player #1`，再依 endpoint 設定建立 `StartGame`。
 - 正式 ANGEL Worker 以每桌各自的 `Player #1` 作為新局邊界；`Stand By`、時間間隔以及同靴「發十局、暫停、再發十局」不會切靴或推進局號。中途啟動先收到其他牌位時跳過該局，下一個 `Player #1` 才恢復送單。
 - 舊部署即使保留 `autoStartNextRoundAfterResult=true` 也會被 Worker 強制停用；`GameResult` 後不再啟動 timer 或預建下一局，避免現場停牌時留下沒有實體賽果的虛構未結算局。
-- Worker 從舊日期狀態恢復時，優先在可信 `FirstCard #0` 切到 UTC 當日 `yyyyMMdd0001/0`，後續 `Player #1` 建立第 1 局；若現場缺少 FirstCard，Player #1 仍會作為跨日安全網。Burn、BurnCount、啟動、重連與 Stand By 不切靴，同日重啟不重設局號。
+- 同一實體靴跨日仍沿用原靴號，下一個可信 `Player #1` 只接續局號；例如 10/18 的 `202610180001/3` 到 10/19 繼續發時，接成 `202610180001/4`。跨日、Burn、BurnCount、啟動、重連與 Stand By 都不會換靴。Worker 從舊日期的有效 `bridge-state.json` 恢復時同樣沿用原靴局。
+- 只有同桌實際 `C → S` 或非重送 `FirstCard #0` 確認換靴後，才按確認當下的 UTC 日期產生下一個靴號、round 歸零；後續 `Player #1` 建立第 1 局。靴號日期代表這靴建立的日期，並不要求每局的發生日期相同；沒有換靴訊號時，`Player #1` 不會因跨日重設靴局。
 - `bridge-state.json` 會保存 `C` 後的等待狀態，因此 Worker 在 `C`、`S` 之間重啟後仍可由同桌 `S` 完成一次；重複 `C/S` 不會重複加靴。
 - 若 `S` 到達時舊局仍未有結果，SQLite 會留下 `IncompleteAtShoeChange`；之後可疑的舊結果會以 `LateGameResultAfterShoeChange` 隔離，兩者仍是 `LocalOnly`。成功換靴的 `NewShoeConfirmed` 現在依該桌傳送權限單次送往 BMS，以新靴 round 0/null roundId 清空 TEL 路圖與舊牌面，不等待第一局。
 - 部署順序：先更新 BMS GameControl 與使用 Core 的平台初始查詢服務，再部署 Worker；舊 BMS 不認得新事件。無 DB migration、不更改 MOXA/BMS 設定。舊 LocalOnly 不升格補送；失敗或 ACK 不明仍不自動重播，等下一個真實新靴牌局更新。單獨 `S` 或 `StandBy` 不觸發清圖。

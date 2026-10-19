@@ -768,11 +768,11 @@ public sealed class ShoeEndpoint
     /// Allocates and arms the next round from the QA-validated, non-retransmission
     /// Player #1 telegram. The card has already been decoded into the endpoint,
     /// so this transition preserves that card while advancing only round identity.
+    /// The shoe remains unchanged across dates until a physical new-shoe confirmation.
     /// </summary>
     public bool TryArmRoundFromPlayerOne(
         DateTimeOffset observedAtUtc,
-        Guid eventUid,
-        DateTime? boundaryUtcTime = null)
+        Guid eventUid)
     {
         if (eventUid == Guid.Empty)
         {
@@ -787,19 +787,11 @@ public sealed class ShoeEndpoint
             return false;
         }
 
-        DateTime utcTime = boundaryUtcTime ?? observedAtUtc.UtcDateTime;
-        if (CurrentShoe <= 0 ||
-            !BridgeGameNumbering.IsShoeForDate(CurrentShoe, utcTime))
+        if (CurrentShoe <= 0)
         {
-            long previousShoe = CurrentShoe;
-            long previousRound = CurrentRound;
-            CurrentShoe = BridgeGameNumbering.FirstShoeForDate(utcTime);
+            CurrentShoe = BridgeGameNumbering.FirstShoeForDate(observedAtUtc.UtcDateTime);
             CurrentRound = 0;
             CurrentRoundId = null;
-            LogReceived?.Invoke(
-                this,
-                "SYS",
-                $"Trusted Player #1 crossed UTC date: {previousShoe}/{previousRound} -> {CurrentShoe}/1.");
         }
 
         CurrentRound++;
@@ -956,8 +948,9 @@ public sealed class ShoeEndpoint
 
     /// <summary>
     /// Starts the next local round and clears preview cards before the betting countdown.
+    /// An existing shoe is retained regardless of its date.
     /// </summary>
-    public void BeginNextRoundCountdown(bool alignShoeDateForNewRound = false)
+    public void BeginNextRoundCountdown()
     {
         if (CurrentShoe <= 0)
         {
@@ -967,14 +960,6 @@ public sealed class ShoeEndpoint
         if (_roundInProgress && !_roundSettled && CurrentRound > 0)
         {
             return;
-        }
-
-        // A game number is immutable after its first card.  The date is checked only
-        // when a new round is about to begin, never while receiving later cards/results.
-        if (alignShoeDateForNewRound && !BridgeGameNumbering.IsShoeForDate(CurrentShoe, DateTime.UtcNow))
-        {
-            StartNewShoe();
-            LogReceived?.Invoke(this, "SYS", $"Cross-day new round: switched BMS shoe to {CurrentShoe}.");
         }
 
         CurrentRound++;

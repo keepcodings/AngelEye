@@ -420,13 +420,13 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task RestoredOldDate_PlayerOneBoundaryUsesUtcDateInsteadOfHostLocalDate()
+    public async Task RestoredOldDate_PlayerOneBoundaryPreservesShoeAndContinuesRound()
     {
         ShoeEndpointSettings endpointSettings =
             Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
         endpointSettings.CurrentShoe = 202607270001;
-        endpointSettings.CurrentRound = 1;
-        endpointSettings.CurrentRoundId = 1;
+        endpointSettings.CurrentRound = 2;
+        endpointSettings.CurrentRoundId = 2;
         endpointSettings.TotalBetTimeSeconds = 0;
         WorkerSettings settings = CreateSettings(
             readOnly: true,
@@ -434,8 +434,7 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
             endpointSettings);
         new WorkerStateStore(settings.Bridge.StatePath).Save(new ShoeEndpoint(endpointSettings));
 
-        // UTC 仍為 7/28，但 Worker host 的 Asia/Taipei 本機時間已進入 7/29。
-        // 靴號日期必須跟隨 UTC，而不是 host local date。
+        // UTC 與 host 的 Asia/Taipei 日期都已晚於靴號日期；同一實體靴仍接續第 3 局。
         FixedTimeProvider clock = new(
             new DateTimeOffset(2026, 7, 28, 16, 6, 0, TimeSpan.Zero),
             TimeSpan.FromHours(8));
@@ -445,14 +444,163 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
 
         endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'D', 0x81, 0xB8));
         await WaitUntilAsync(
-            () => CountEvents(settings.Bridge.DatabasePath, type: "StartGame") == 1,
+            () => CountEvents(settings.Bridge.DatabasePath, type: "StartGame") == 1 &&
+                  CountEvents(settings.Bridge.DatabasePath, type: "CardDrawn") == 1,
             cancellation.Token);
 
-        Assert.Equal(202607280001, endpoint.CurrentShoe);
-        Assert.Equal(1, endpoint.CurrentRound);
+        endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'D', 0x91, 0x4D));
+        endpoint.Listener.InjectBytes(BuildActiveReport('3', (byte)'D', 0x82, 0xB9));
+        endpoint.Listener.InjectBytes(BuildActiveReport('4', (byte)'D', 0x92, 0x41));
+        endpoint.Listener.InjectBytes(BuildActiveReport('5', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 1,
+            cancellation.Token);
+
+        Assert.Equal(202607270001, endpoint.CurrentShoe);
+        Assert.Equal(3, endpoint.CurrentRound);
+        Assert.Equal(3, endpoint.CurrentRoundId);
         Assert.Equal(
-            [(202607280001L, 1L)],
+            [(202607270001L, 3L)],
             ReadEventIdentities(settings.Bridge.DatabasePath, "StartGame"));
+        Assert.Equal(
+            Enumerable.Repeat((202607270001L, 3L), 4),
+            ReadEventIdentities(settings.Bridge.DatabasePath, "CardDrawn"));
+        Assert.Equal(
+            [(202607270001L, 3L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "GameResult"));
+        Assert.Equal(0, CountEvents(settings.Bridge.DatabasePath, type: "NewShoeConfirmed"));
+    }
+
+    [Theory]
+    [InlineData(15)] // Asia/Taipei midnight, while the UTC date remains unchanged.
+    [InlineData(23)] // UTC midnight, while the Asia/Taipei date remains unchanged.
+    public async Task MidnightDuringDealing_PreservesShoeForCurrentAndNextRound(int utcHour)
+    {
+        const long originalShoe = 202607280007;
+        ShoeEndpointSettings endpointSettings =
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
+        endpointSettings.CurrentShoe = originalShoe;
+        endpointSettings.TotalBetTimeSeconds = 0;
+        WorkerSettings settings = CreateSettings(true, null, endpointSettings);
+        FixedTimeProvider clock = new(
+            new DateTimeOffset(2026, 7, 28, utcHour, 59, 0, TimeSpan.Zero),
+            TimeSpan.FromHours(8));
+        await using AngelBridgeWorker worker = new(settings, clock);
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+        ShoeEndpoint endpoint = worker.Endpoints[0];
+
+        byte[] firstPlayerCard = BuildActiveReport('1', (byte)'D', 0x81, 0xB8);
+        endpoint.Listener.InjectBytes(firstPlayerCard);
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "CardDrawn") == 1,
+            cancellation.Token);
+        Guid? firstStartGameUid = endpoint.StartGameEventUid;
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        endpoint.Listener.InjectBytes(firstPlayerCard);
+        endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'D', 0x91, 0x4D));
+        endpoint.Listener.InjectBytes(BuildActiveReport('3', (byte)'D', 0x82, 0xB9));
+        endpoint.Listener.InjectBytes(BuildActiveReport('4', (byte)'D', 0x92, 0x41));
+        endpoint.Listener.InjectBytes(BuildActiveReport('5', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 1 &&
+                  endpoint.RoundPhase == BridgeRoundPhases.WaitingForRoundBoundary,
+            cancellation.Token);
+
+        Assert.Equal(originalShoe, endpoint.CurrentShoe);
+        Assert.Equal(2, endpoint.CurrentRound);
+        Assert.Equal(firstStartGameUid, endpoint.StartGameEventUid);
+        Assert.Equal(1, CountEvents(settings.Bridge.DatabasePath, type: "StartGame"));
+
+        endpoint.Listener.InjectBytes(BuildActiveReport('6', (byte)'D', 0x81, 0xB7));
+        endpoint.Listener.InjectBytes(BuildActiveReport('7', (byte)'D', 0x91, 0x4D));
+        endpoint.Listener.InjectBytes(BuildActiveReport('8', (byte)'D', 0x82, 0xB9));
+        endpoint.Listener.InjectBytes(BuildActiveReport('9', (byte)'D', 0x92, 0x41));
+        endpoint.Listener.InjectBytes(BuildActiveReport('0', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 2 &&
+                  endpoint.RoundPhase == BridgeRoundPhases.WaitingForRoundBoundary,
+            cancellation.Token);
+
+        Assert.Equal(originalShoe, endpoint.CurrentShoe);
+        Assert.Equal(3, endpoint.CurrentRound);
+        Assert.Equal(3, endpoint.CurrentRoundId);
+        Assert.Equal(
+            [(originalShoe, 2L), (originalShoe, 3L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "StartGame"));
+        Assert.Equal(
+            Enumerable.Repeat((originalShoe, 2L), 4)
+                .Concat(Enumerable.Repeat((originalShoe, 3L), 4)),
+            ReadEventIdentities(settings.Bridge.DatabasePath, "CardDrawn"));
+        Assert.Equal(
+            [(originalShoe, 2L), (originalShoe, 3L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "GameResult"));
+        Assert.Equal(0, CountEvents(settings.Bridge.DatabasePath, type: "NewShoeConfirmed"));
+        Assert.Equal(2, CountEvents(settings.Bridge.DatabasePath, type: "StartGame", status: "Pending"));
+        Assert.Equal(8, CountEvents(settings.Bridge.DatabasePath, type: "CardDrawn", status: "Pending"));
+        Assert.Equal(2, CountEvents(settings.Bridge.DatabasePath, type: "GameResult", status: "Pending"));
+    }
+
+    [Fact]
+    public async Task RestartAfterUtcMidnight_ContinuesPersistedShoeAndRound()
+    {
+        const long originalShoe = 202607280007;
+        ShoeEndpointSettings endpointSettings =
+            Endpoint("901", "SHOE901", bmsTransmitEnabled: true);
+        endpointSettings.CurrentShoe = originalShoe;
+        endpointSettings.TotalBetTimeSeconds = 0;
+        WorkerSettings settings = CreateSettings(true, null, endpointSettings);
+        FixedTimeProvider clock = new(
+            new DateTimeOffset(2026, 7, 28, 23, 59, 0, TimeSpan.Zero),
+            TimeSpan.FromHours(8));
+        using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+
+        await using (AngelBridgeWorker firstWorker = new(settings, clock))
+        {
+            ShoeEndpoint endpoint = firstWorker.Endpoints[0];
+            endpoint.Listener.InjectBytes(BuildActiveReport('1', (byte)'D', 0x81, 0xB8));
+            endpoint.Listener.InjectBytes(BuildActiveReport('2', (byte)'D', 0x91, 0x4D));
+            endpoint.Listener.InjectBytes(BuildActiveReport('3', (byte)'D', 0x82, 0xB9));
+            endpoint.Listener.InjectBytes(BuildActiveReport('4', (byte)'D', 0x92, 0x41));
+            endpoint.Listener.InjectBytes(BuildActiveReport('5', (byte)'G', 0x91));
+            await WaitUntilAsync(
+                () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 1 &&
+                      endpoint.RoundPhase == BridgeRoundPhases.WaitingForRoundBoundary,
+                cancellation.Token);
+            Assert.Equal(2, endpoint.CurrentRound);
+        }
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        await using AngelBridgeWorker restoredWorker = new(settings, clock);
+        ShoeEndpoint restored = restoredWorker.Endpoints[0];
+        Assert.Equal(originalShoe, restored.CurrentShoe);
+        Assert.Equal(2, restored.CurrentRound);
+        Assert.Equal(BridgeRoundPhases.WaitingForRoundBoundary, restored.RoundPhase);
+
+        restored.Listener.InjectBytes(BuildActiveReport('6', (byte)'D', 0x81, 0xB7));
+        restored.Listener.InjectBytes(BuildActiveReport('7', (byte)'D', 0x91, 0x4D));
+        restored.Listener.InjectBytes(BuildActiveReport('8', (byte)'D', 0x82, 0xB9));
+        restored.Listener.InjectBytes(BuildActiveReport('9', (byte)'D', 0x92, 0x41));
+        restored.Listener.InjectBytes(BuildActiveReport('0', (byte)'G', 0x91));
+        await WaitUntilAsync(
+            () => CountEvents(settings.Bridge.DatabasePath, type: "GameResult") == 2 &&
+                  restored.RoundPhase == BridgeRoundPhases.WaitingForRoundBoundary,
+            cancellation.Token);
+
+        Assert.Equal(originalShoe, restored.CurrentShoe);
+        Assert.Equal(3, restored.CurrentRound);
+        Assert.Equal(3, restored.CurrentRoundId);
+        Assert.Equal(
+            [(originalShoe, 2L), (originalShoe, 3L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "StartGame"));
+        Assert.Equal(
+            Enumerable.Repeat((originalShoe, 2L), 4)
+                .Concat(Enumerable.Repeat((originalShoe, 3L), 4)),
+            ReadEventIdentities(settings.Bridge.DatabasePath, "CardDrawn"));
+        Assert.Equal(
+            [(originalShoe, 2L), (originalShoe, 3L)],
+            ReadEventIdentities(settings.Bridge.DatabasePath, "GameResult"));
+        Assert.Equal(0, CountEvents(settings.Bridge.DatabasePath, type: "NewShoeConfirmed"));
     }
 
     [Fact]
@@ -1329,7 +1477,7 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
 
     private sealed class FixedTimeProvider : TimeProvider
     {
-        private readonly DateTimeOffset _utcNow;
+        private DateTimeOffset _utcNow;
         private readonly TimeZoneInfo _localTimeZone;
 
         public FixedTimeProvider(DateTimeOffset utcNow, TimeSpan localOffset)
@@ -1343,6 +1491,8 @@ public sealed class WorkerBmsFailClosedTests : IAsyncLifetime
         }
 
         public override DateTimeOffset GetUtcNow() => _utcNow;
+
+        public void Advance(TimeSpan elapsed) => _utcNow += elapsed;
 
         public override TimeZoneInfo LocalTimeZone => _localTimeZone;
     }
